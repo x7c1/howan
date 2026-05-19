@@ -424,11 +424,12 @@ impl PointerHandler for HowanApp {
         pointer: &WlPointer,
         events: &[PointerEvent],
     ) {
-        // Press dismisses the window. On Enter we hide the cursor by attaching
-        // a null surface to the pointer image — Wayland leaves the compositor's
-        // default cursor visible otherwise, which is distracting on a blank
-        // overlay. Motion / Leave / axis events are intentionally ignored so
-        // that incidental mouse movement on wake does not exit prematurely.
+        // Any pointer motion or button press dismisses the window — this
+        // matches the traditional screensaver UX where the user expects mere
+        // mouse movement to wake the screen. On Enter we hide the cursor by
+        // attaching a null surface to the pointer image; Wayland leaves the
+        // compositor's default cursor visible otherwise, which is distracting
+        // on a blank overlay. Leave / axis events are ignored.
         for event in events {
             if event.surface != *self.window.wl_surface() {
                 continue;
@@ -437,7 +438,7 @@ impl PointerHandler for HowanApp {
                 PointerEventKind::Enter { serial } => {
                     pointer.set_cursor(serial, None, 0, 0);
                 }
-                PointerEventKind::Press { .. } => {
+                PointerEventKind::Motion { .. } | PointerEventKind::Press { .. } => {
                     self.dismiss();
                     break;
                 }
