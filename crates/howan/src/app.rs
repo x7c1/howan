@@ -421,19 +421,27 @@ impl PointerHandler for HowanApp {
         &mut self,
         _conn: &Connection,
         _qh: &QueueHandle<Self>,
-        _pointer: &WlPointer,
+        pointer: &WlPointer,
         events: &[PointerEvent],
     ) {
-        // Any pointer button press over our surface dismisses the window.
-        // Motion, enter/leave, and axis events are intentionally ignored so
+        // Press dismisses the window. On Enter we hide the cursor by attaching
+        // a null surface to the pointer image — Wayland leaves the compositor's
+        // default cursor visible otherwise, which is distracting on a blank
+        // overlay. Motion / Leave / axis events are intentionally ignored so
         // that incidental mouse movement on wake does not exit prematurely.
         for event in events {
             if event.surface != *self.window.wl_surface() {
                 continue;
             }
-            if matches!(event.kind, PointerEventKind::Press { .. }) {
-                self.dismiss();
-                break;
+            match event.kind {
+                PointerEventKind::Enter { serial } => {
+                    pointer.set_cursor(serial, None, 0, 0);
+                }
+                PointerEventKind::Press { .. } => {
+                    self.dismiss();
+                    break;
+                }
+                _ => {}
             }
         }
     }
