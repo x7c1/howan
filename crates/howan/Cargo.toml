@@ -5,3 +5,12 @@ edition = "2021"
 license = "GPL-3.0-only"
 description = "A lightweight Wayland screensaver"
 repository = "https://github.com/x7c1/howan"
+
+[dependencies]
+# `xkbcommon` is part of SCTK's default features but pulls in libxkbcommon-dev
+# as a system dependency. M1 only needs "any key was pressed", so we bind
+# `wl_keyboard` events directly through `wayland-client` and skip the full
+# keymap pipeline. Later milestones can opt back in if real key handling is
+# needed.
+smithay-client-toolkit = { version = "0.20", default-features = false, features = ["calloop"] }
+wayland-client = "0.31"

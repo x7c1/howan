@@ -28,6 +28,11 @@ cargo build && cargo test && cargo clippy --all-targets -- -D warnings
 
 Fix any issues before considering the task complete.
 
+### Fix issues as you find them
+
+- When you notice code smells or inappropriate patterns (silent error suppression, missing logs, inconsistent naming, etc.) during implementation, fix them in the same PR. Do not leave them for later or require the user to point them out.
+- Do not defer cleanup of code you just wrote to a future PR. Duplicated queries, awkward interfaces, and missing abstractions in newly written code should be addressed immediately — merging bad code and fixing it later costs more than getting it right now. Reserve "out of scope" for genuinely unrelated large-scale refactors, not for polish on your own changes.
+
 ## Language
 
 Documentation, code comments, commit messages, and pull-request descriptions are written in English.
