@@ -173,6 +173,7 @@ pub fn run() -> Result<(), Box<dyn Error>> {
         pointer: None,
         touch: None,
         active_output: None,
+        configured: false,
         exit: false,
     };
 
@@ -208,6 +209,12 @@ pub(crate) struct HowanApp {
     /// surface entered (M1 "active output only"); until a surface-enter event
     /// arrives we fall back to the first advertised output.
     pub(crate) active_output: Option<WlOutput>,
+    /// Set once the xdg surface has received its first configure. We must not
+    /// attach a buffer and commit before that (xdg-shell forbids committing a
+    /// buffer to a surface that has never been configured); output/seat events
+    /// can otherwise trigger `draw()` too early. Strict compositors (e.g.
+    /// `weston`) reject the premature commit; Mutter tolerates it.
+    pub(crate) configured: bool,
     pub(crate) exit: bool,
 }
 
