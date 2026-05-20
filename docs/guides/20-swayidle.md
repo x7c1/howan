@@ -9,6 +9,12 @@ invoke howan accordingly. This guide documents the exact swayidle invocation
 that drives howan, how the `start`/`stop` lifecycle works, and the result of the
 manual verification against a real GNOME / Mutter Wayland session.
 
+> **Known limitation:** this swayidle approach does **not** work on GNOME/Mutter
+> — Mutter does not implement the `ext-idle-notify-v1` idle-detection protocol
+> swayidle needs (it offers only idle *inhibit*). See "Idle detection on
+> GNOME/Mutter" below. The `start`/`stop` CLI is verified and works; only the
+> swayidle-driven idle trigger is unavailable on the primary target.
+
 Key points:
 
 - Run howan under swayidle with `timeout <N> 'howan start'` and
@@ -78,17 +84,31 @@ Record the outcome here.
 
 Target session: GNOME / Mutter on Wayland (Ubuntu 26.04).
 
-| Check                                                      | Result (2026-05-20)                                   |
-| ---------------------------------------------------------- | ----------------------------------------------------- |
-| Saver appears after the idle timeout                       | not tested — swayidle not installed                   |
-| Saver disappears on resume (`howan stop` via SIGTERM)      | PASS — verified via direct `howan stop`, not the hook |
-| `start` instance exits with status 0 after `stop`          | PASS                                                  |
-| PID file removed after the cycle                           | PASS                                                  |
-| Saver surface actually rendered **on top**                 | appeared/covered the screen — but see the incident    |
+| Check                                                       | Result (2026-05-21)                                              |
+| ----------------------------------------------------------- | ---------------------------------------------------------------- |
+| swayidle drives `howan start` after the idle timeout        | **BLOCKED** — see "Idle detection on GNOME/Mutter" below         |
+| Saver disappears on resume (`howan stop`)                   | depends on the idle hook above; `stop` itself verified           |
+| `start` exits status 0 after `stop`; PID file removed       | PASS — exercised directly on a headless `weston`                 |
+| `stop` is a clean no-op on a missing/stale PID file         | PASS                                                             |
+| `start` commits no buffer before the first xdg `configure`  | PASS — confirmed on a strict (`weston`) compositor               |
+| `howan start` is safe on real NVIDIA Blackwell              | PASS — see `30-composited-surface.md` Stage 2 (no display wedge) |
 
-> Note on top-most: Mutter does not implement `wlr-layer-shell`, so an
-> xdg-shell fullscreen window is not guaranteed to sit above every other
-> surface. In the run below the saver did cover a fullscreen Chrome window.
+### Idle detection on GNOME/Mutter — not available
+
+On the target GNOME / Mutter session, swayidle exits immediately with
+`Compositor doesn't support idle protocol`. Mutter advertises
+`zwp_idle_inhibit_manager_v1` (idle *inhibit*) but **not** `ext-idle-notify-v1`
+(idle *notify*) nor `org_kde_kwin_idle`, so no Wayland client — swayidle
+included — can detect idle on this compositor. (swayidle itself does support
+`ext-idle-notify-v1`; the gap is on Mutter's side.)
+
+Consequence: the swayidle-driven idle → saver → resume flow cannot run on
+GNOME/Mutter as designed. The `howan start` / `stop` CLI and lifecycle are
+correct and verified independently (above). Driving the saver on GNOME needs a
+different idle source — e.g. the `org.gnome.Mutter.IdleMonitor` or
+`org.freedesktop.ScreenSaver` D-Bus interfaces — which is an architecture
+question beyond this milestone. Top-most coverage on Mutter (no
+`wlr-layer-shell`) is discussed in `30-composited-surface.md`.
 
 The CLI-level lifecycle (start writes the PID file, stop signals it, no-op on a
 missing/stale file, PID file cleaned up) is verified directly by exercising the
