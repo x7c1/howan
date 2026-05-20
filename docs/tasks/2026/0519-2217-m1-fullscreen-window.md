@@ -8,7 +8,6 @@ retries_remaining: 1
 check_command: "cargo build && cargo test && cargo clippy --all-targets -- -D warnings"
 assignee: null
 branch: task/0519-2217-m1-fullscreen-window
-run_log: /home/x7c1/repos/haco-studio/atelier/.tmp/task-loop/0519-2217-m1-fullscreen-window-20260519_2238.md
 created_at: 2026-05-19T13:17:59Z
 updated_at: 2026-05-19T14:24:44Z
 ---

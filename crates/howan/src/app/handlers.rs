@@ -69,9 +69,18 @@ impl CompositorHandler for HowanApp {
         &mut self,
         _conn: &Connection,
         _qh: &QueueHandle<Self>,
-        _surface: &WlSurface,
-        _output: &wl_output::WlOutput,
+        surface: &WlSurface,
+        output: &wl_output::WlOutput,
     ) {
+        // The compositor tells us which output the surface is shown on. Adopt
+        // it as the active output and size the surface to that output's mode.
+        if surface != self.window.wl_surface() {
+            return;
+        }
+        self.active_output = Some(output.clone());
+        if self.resize_to_active_output() {
+            self.draw();
+        }
     }
 
     fn surface_leave(
@@ -95,6 +104,12 @@ impl OutputHandler for HowanApp {
         _qh: &QueueHandle<Self>,
         _output: wl_output::WlOutput,
     ) {
+        // Output geometry may only become available after startup. Once it is,
+        // size the surface to it (falls back to the first output until a
+        // surface-enter event picks the real active one).
+        if self.resize_to_active_output() {
+            self.draw();
+        }
     }
 
     fn update_output(
@@ -103,6 +118,11 @@ impl OutputHandler for HowanApp {
         _qh: &QueueHandle<Self>,
         _output: wl_output::WlOutput,
     ) {
+        // The active output's mode may change (e.g. resolution switch); follow
+        // it.
+        if self.resize_to_active_output() {
+            self.draw();
+        }
     }
 
     fn output_destroyed(
@@ -128,22 +148,25 @@ impl WindowHandler for HowanApp {
         configure: WindowConfigure,
         _serial: u32,
     ) {
-        // Adopt the compositor-suggested size; fall back to the renderer's
-        // current size only when the compositor leaves a dimension unset
-        // (`None`, encoded as `0` on the wire and meaning "client decides").
-        // For a fullscreen surface the compositor almost always supplies the
-        // output size.
-        let new_width = configure
-            .new_size
-            .0
-            .map(|v| v.get())
-            .unwrap_or_else(|| self.renderer.width());
-        let new_height = configure
-            .new_size
-            .1
-            .map(|v| v.get())
-            .unwrap_or_else(|| self.renderer.height());
-        self.renderer.resize(new_width, new_height);
+        // Prefer the active output's mode size — that is the size we actually
+        // want to cover now that we no longer call `set_fullscreen`. If the
+        // output geometry is not yet known, fall back to the compositor's
+        // suggested size, and finally to the current allocation when the
+        // compositor leaves a dimension unset (`None`, encoded as `0` on the
+        // wire, meaning "client decides").
+        if !self.resize_to_active_output() {
+            let new_width = configure
+                .new_size
+                .0
+                .map(|v| v.get())
+                .unwrap_or_else(|| self.renderer.width());
+            let new_height = configure
+                .new_size
+                .1
+                .map(|v| v.get())
+                .unwrap_or_else(|| self.renderer.height());
+            self.renderer.resize(new_width, new_height);
+        }
         self.draw();
     }
 }
