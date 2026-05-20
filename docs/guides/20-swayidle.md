@@ -78,19 +78,51 @@ Record the outcome here.
 
 Target session: GNOME / Mutter on Wayland (Ubuntu 26.04).
 
-| Check                                                      | Result        |
-| ---------------------------------------------------------- | ------------- |
-| Saver appears after the idle timeout                       | _pending_     |
-| Saver disappears on resume (`howan stop` via SIGTERM)      | _pending_     |
-| `start` instance exits with status 0 after `stop`          | _pending_     |
-| PID file removed after the cycle                           | _pending_     |
-| Saver surface actually rendered **on top**                 | _pending_     |
+| Check                                                      | Result (2026-05-20)                                   |
+| ---------------------------------------------------------- | ----------------------------------------------------- |
+| Saver appears after the idle timeout                       | not tested — swayidle not installed                   |
+| Saver disappears on resume (`howan stop` via SIGTERM)      | PASS — verified via direct `howan stop`, not the hook |
+| `start` instance exits with status 0 after `stop`          | PASS                                                  |
+| PID file removed after the cycle                           | PASS                                                  |
+| Saver surface actually rendered **on top**                 | appeared/covered the screen — but see the incident    |
 
 > Note on top-most: Mutter does not implement `wlr-layer-shell`, so an
 > xdg-shell fullscreen window is not guaranteed to sit above every other
-> surface. The "rendered on top" row above records what was actually observed;
-> a guaranteed always-on-top overlay is out of scope for this milestone.
+> surface. In the run below the saver did cover a fullscreen Chrome window.
 
 The CLI-level lifecycle (start writes the PID file, stop signals it, no-op on a
-missing/stale file, PID file cleaned up) was verified directly by exercising the
-binary; only the on-screen swayidle behavior remains a manual desktop check.
+missing/stale file, PID file cleaned up) is verified directly by exercising the
+binary.
+
+### ⚠️ Incident: full system lockup on NVIDIA Blackwell (2026-05-20)
+
+Launching `howan start` to manually check the on-screen behavior caused an
+**unrecoverable display freeze that required a hard reboot.**
+
+- **Environment:** GeForce RTX 5060 Ti (GB206, Blackwell) · NVIDIA open kernel
+  module 595.58.03 · Linux 7.0 · GNOME Shell / Mutter 50.1 on Wayland.
+- **Trigger:** `howan start` mapped its fullscreen surface while Chrome was
+  playing a fullscreen YouTube video. The saver covered the screen, then the
+  session became unrecoverable.
+- **Crash boot journal:** `gnome-shell` crashed with SIGSEGV, after which the
+  NVIDIA display engine wedged (`nvidia-modeset: Failed to query display engine
+  channel state`), the GSP firmware crashed (`GSP-CrashCat` / `RC_TRIGGERED`)
+  with IOMMU `IO_PAGE_FAULT`s, and the compositor could not be restarted
+  (EGL/KMS init failed: "not supported by EGL"). Only a hard reboot recovered.
+- **`howan`'s role:** the saver process itself had already exited cleanly
+  (status 0, PID file removed) ~11 s *before* the compositor crash. The fault
+  is not a `howan` logic defect — it is a known **Blackwell (RTX 50-series)
+  NVIDIA driver / GSP-firmware bug**: a display-engine / atomic-modeset
+  operation collapses the GSP firmware and kills the display engine until a
+  hard reset (reported across nvidia-open 580.x / 595.x). `howan`'s fullscreen
+  surface forced the Mutter modeset that triggered it, concurrent with Chrome's
+  GPU video-decode load.
+
+**Verification policy until this is resolved upstream:** do **not** run
+`howan start` directly on an NVIDIA Blackwell + Wayland desktop session. Verify
+on non-NVIDIA hardware, or in a software-rendered / headless Wayland session, so
+a GPU-firmware crash cannot take down the host. The swayidle end-to-end and
+top-most checks above remain outstanding for that reason.
+
+References: NVIDIA RTX 5060 Ti / Blackwell GSP firmware crash reports on the
+[NVIDIA developer forums](https://forums.developer.nvidia.com/t/regression-nvidia-modeset-kernel-panic-kwin-wayland-crash-on-5060-ti-blackwell-under-high-vram-load/351517).
