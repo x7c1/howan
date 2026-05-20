@@ -13,8 +13,8 @@ Key points:
 
 - Run howan under swayidle with `timeout <N> 'howan start'` and
   `resume 'howan stop'`.
-- `howan start` opens the fullscreen saver; `howan stop` terminates a running
-  saver. Running `howan` with no subcommand is equivalent to `howan start`.
+- `howan start` opens the saver; `howan stop` terminates a running saver.
+  Running `howan` with no subcommand is equivalent to `howan start`.
 - The two processes communicate through a PID file at
   `$XDG_RUNTIME_DIR/howan.pid`; `stop` sends `SIGTERM`, which unwinds the saver
   through its normal clean-exit path.
@@ -23,7 +23,7 @@ Key points:
 
 | Command       | Behavior                                                            |
 | ------------- | ------------------------------------------------------------------- |
-| `howan start` | Launch the fullscreen saver. Blocks until dismissed or stopped.     |
+| `howan start` | Launch the saver. Blocks until dismissed or stopped.                |
 | `howan stop`  | Terminate a running saver. No-op success if none is running.        |
 | `howan`       | No subcommand: defaults to `start`.                                 |
 
@@ -118,11 +118,18 @@ Launching `howan start` to manually check the on-screen behavior caused an
   surface forced the Mutter modeset that triggered it, concurrent with Chrome's
   GPU video-decode load.
 
-**Verification policy until this is resolved upstream:** do **not** run
-`howan start` directly on an NVIDIA Blackwell + Wayland desktop session. Verify
-on non-NVIDIA hardware, or in a software-rendered / headless Wayland session, so
-a GPU-firmware crash cannot take down the host. The swayidle end-to-end and
-top-most checks above remain outstanding for that reason.
+**Resolution:** howan no longer calls `set_fullscreen`. It now covers the output
+with an ordinary composited (non-fullscreen, non-opaque) surface, which stays
+off Mutter's unredirect / direct-scanout modeset path and so does not trigger
+this crash. See [30-composited-surface.md](30-composited-surface.md), where a
+Stage 2 run on the actual Blackwell session confirmed no display-engine wedge.
+The description above is the historical fullscreen build at the time of the
+incident.
+
+**Caution for any future fullscreen experiment:** do **not** run a
+`set_fullscreen` build directly on an NVIDIA Blackwell + Wayland desktop session.
+Verify in a software-rendered / headless Wayland session, or under an SSH guard,
+so a GPU-firmware crash cannot take down the host.
 
 References: NVIDIA RTX 5060 Ti / Blackwell GSP firmware crash reports on the
 [NVIDIA developer forums](https://forums.developer.nvidia.com/t/regression-nvidia-modeset-kernel-panic-kwin-wayland-crash-on-5060-ti-blackwell-under-high-vram-load/351517).

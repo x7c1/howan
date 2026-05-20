@@ -7,7 +7,7 @@
 //! ```
 //!
 //! so the CLI only needs two subcommands for M2: `start` launches the
-//! fullscreen saver, `stop` terminates a running saver. Running `howan` with no
+//! saver, `stop` terminates a running saver. Running `howan` with no
 //! subcommand defaults to `start`, which is the common interactive case ("just
 //! show the saver now") and matches what the M1 binary did before the CLI
 //! existed.
@@ -27,7 +27,7 @@ pub struct Cli {
 
 #[derive(Debug, Subcommand)]
 pub enum Command {
-    /// Launch the fullscreen saver (blocks until dismissed or stopped).
+    /// Launch the saver (blocks until dismissed or stopped).
     Start,
     /// Terminate a running saver. A no-op success if none is running.
     Stop,

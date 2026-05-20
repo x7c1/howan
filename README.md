@@ -15,7 +15,7 @@ cargo build
 ## Run
 
 ```bash
-howan start   # launch the fullscreen saver (default when no subcommand is given)
+howan start   # launch the saver (default when no subcommand is given)
 howan stop    # terminate a running saver (no-op if none is running)
 ```
 
