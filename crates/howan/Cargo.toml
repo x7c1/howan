@@ -14,3 +14,15 @@ repository = "https://github.com/x7c1/howan"
 # needed.
 smithay-client-toolkit = { version = "0.20", default-features = false, features = ["calloop"] }
 wayland-client = "0.31"
+# Depend on calloop directly (the same version SCTK pulls in) so we can enable
+# its `signals` feature. This gives a `signalfd`-backed event source that
+# delivers SIGTERM/SIGINT through the running event loop, letting us reuse the
+# existing clean-exit path instead of aborting from an async signal handler.
+calloop = { version = "0.14", features = ["signals"] }
+# Minimal CLI: `start` / `stop` subcommands. The derive API is the conventional
+# choice and will carry forward to later milestones (config-file overrides etc.).
+clap = { version = "4", features = ["derive"] }
+# Used for `kill(pid, 0)` liveness probes and `kill(pid, SIGTERM)` from
+# `howan stop`. Already in the tree transitively; declared directly here so the
+# unsafe FFI calls have a first-class dependency.
+libc = "0.2"
