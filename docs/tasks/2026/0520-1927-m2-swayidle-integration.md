@@ -8,7 +8,6 @@ retries_remaining: 1
 check_command: "cargo build && cargo test && cargo clippy --all-targets -- -D warnings"
 assignee: null
 branch: task/0520-1927-m2-swayidle-integration
-run_log: /home/x7c1/repos/haco-studio/atelier/.tmp/task-loop/0520-1927-m2-swayidle-integration-20260520_2019.md
 created_at: 2026-05-20T10:27:49Z
 updated_at: 2026-05-20T11:32:54Z
 ---

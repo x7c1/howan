@@ -30,7 +30,7 @@ impl Renderer {
         initial_width: u32,
         initial_height: u32,
     ) -> Result<Self, Box<dyn std::error::Error>> {
-        // Pre-size the pool for one full BGRA buffer at the initial dimensions.
+        // Pre-size the pool for one full ARGB8888 buffer at the initial dimensions.
         // The pool grows on demand when the compositor configures a larger size.
         let pool_size = (initial_width * initial_height * 4) as usize;
         let pool = SlotPool::new(pool_size, &shm)?;
@@ -82,18 +82,17 @@ impl Renderer {
         let buffer = match self.buffer.as_ref() {
             Some(buffer) => buffer,
             None => {
-                let (buffer, canvas) = match self.pool.create_buffer(
-                    width,
-                    height,
-                    stride,
-                    wl_shm::Format::Argb8888,
-                ) {
-                    Ok(pair) => pair,
-                    Err(err) => {
-                        eprintln!("howan: failed to allocate shm buffer: {err}");
-                        return;
-                    }
-                };
+                let (buffer, canvas) =
+                    match self
+                        .pool
+                        .create_buffer(width, height, stride, wl_shm::Format::Argb8888)
+                    {
+                        Ok(pair) => pair,
+                        Err(err) => {
+                            eprintln!("howan: failed to allocate shm buffer: {err}");
+                            return;
+                        }
+                    };
                 // ARGB8888 little-endian layout in memory is [B, G, R, A].
                 // Fully opaque black is `0x00, 0x00, 0x00, 0xFF`.
                 for px in canvas.chunks_exact_mut(4) {
