@@ -255,5 +255,21 @@ Record:
 - Whether the saver displayed and dismissed without wedging the display engine.
 - Any `nvidia-modeset` / `GSP` errors observed in the captured log.
 
-**Status: outstanding — this is the gate that must be cleared before declaring
-howan safe to run on Blackwell.**
+**Status: PASSED, 2026-05-21.** Run on the actual NVIDIA Blackwell + GNOME/Mutter
+Wayland session (open kernel module 595.58.03, a 5120×2160 output), launched and
+monitored from a phone SSH session per the procedure above.
+
+- **No display-engine wedge.** The saver displayed and dismissed on input (mouse)
+  with no freeze. The captured kernel log showed none of the crash signatures
+  from the original incident — no `RC_TRIGGERED`, `GSP-CrashCat`, `IO_PAGE_FAULT`,
+  "Failed to query display engine", NVRM `Xid`, or `gnome-shell` SIGSEGV. This is
+  the gate, and it is cleared: the composited-surface approach runs safely on
+  Blackwell.
+- **Wire trace** confirmed no `set_fullscreen` and no `set_opaque_region`; the
+  toplevel was sized to the output's advertised mode (`set_min/max_size`
+  5120×2160 matching `wl_output.mode`).
+- **Coverage (expected limitation):** the GNOME top panel remained visible — the
+  composited toplevel does not cover the panel or guarantee top-most stacking.
+  This is the open top-most-coverage question above, not a regression; full
+  coverage would require `set_fullscreen`/layer-shell, which is exactly what this
+  workaround avoids (and what the Restoration path would later restore).
