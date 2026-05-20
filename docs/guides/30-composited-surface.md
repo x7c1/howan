@@ -146,32 +146,46 @@ requires a running Wayland GUI session. Two stages are defined. **Both are
 currently outstanding (not yet performed in this change.)** Do not treat the
 task as fully verified until they are done and recorded here.
 
-### Stage 1 — safe, protocol-level (software-rendered / non-NVIDIA)
+### Stage 1 — safe, protocol-level (software-rendered / headless)
 
-Goal: confirm howan no longer issues `set_fullscreen`, stays on the composited
-path, appears, and dismisses on input — on hardware where a modeset cannot wedge
-a Blackwell GPU.
+Goal: confirm howan no longer issues `set_fullscreen` and stays on the
+composited path, on a compositor that cannot trigger the dangerous modeset.
 
-Run on a **non-NVIDIA or software-rendered / headless Wayland** session, e.g. a
-VM with virtio-gpu, llvmpipe, or `weston` with the pixman renderer:
+The safety requirement is **software-rendered / headless**, not non-NVIDIA
+hardware. A headless compositor with a software (pixman/llvmpipe) renderer
+drives no real KMS output and initializes no GPU, so it does **not** touch the
+NVIDIA display engine — it is therefore safe to run **on the Blackwell machine
+itself** (a separate non-NVIDIA box is not required). Do not confuse this with a
+*nested GPU* compositor (`mutter --nested`, `sway` on the DRM/GPU backend),
+which shares the GPU and is not safe; see Stage 2.
+
+Run a headless software compositor, e.g. `weston` with the pixman renderer (on
+Debian/Ubuntu: `sudo apt install weston`):
 
 ```bash
-# Example: a nested weston with the software (pixman) renderer.
-weston --backend=headless --renderer=pixman --width=1920 --height=1080 &
-# Point howan at that compositor.
-WAYLAND_DISPLAY=wayland-1 cargo run
+# Start a headless, software-rendered weston. It creates its own wayland socket
+# (e.g. wayland-1) under $XDG_RUNTIME_DIR and never drives the real display.
+weston --backend=headless-backend.so --renderer=pixman --width=1920 --height=1080 \
+  --socket=wayland-stage1 &
 
-# In another terminal, confirm no fullscreen request is sent on the wire:
-WAYLAND_DEBUG=1 WAYLAND_DISPLAY=wayland-1 cargo run 2>&1 \
-  | grep -i 'set_fullscreen' && echo "UNEXPECTED set_fullscreen" || echo "ok: no set_fullscreen"
+# Run howan against THAT socket — never the real session's wayland-0.
+# Headless has no input device, so the saver will not dismiss on its own; cap the
+# run with a timeout and inspect the protocol it spoke.
+WAYLAND_DEBUG=1 WAYLAND_DISPLAY=wayland-stage1 timeout 5 cargo run 2>wire.log; \
+  grep -i 'set_fullscreen' wire.log && echo "UNEXPECTED set_fullscreen" \
+    || echo "ok: no set_fullscreen on the wire"
 ```
 
-Record:
+What a headless run can and cannot confirm:
 
-- Whether the saver appears.
-- Whether any keyboard / pointer / touch input dismisses it with exit status 0.
-- Whether it actually covered the output and stayed on top (this connects to
-  the unresolved top-most question above — report honestly, do not assume).
+- **Can (protocol level):** howan sends no `xdg_toplevel.set_fullscreen`, creates a
+  normal `xdg_toplevel`, and commits a buffer sized to the advertised output —
+  visible in `wire.log` (`xdg_toplevel`, `set_min_size`/`set_max_size`,
+  `wl_surface.commit`, no `set_fullscreen`, no `set_opaque_region`).
+- **Cannot (visual/input):** that the saver is *visible*, *dismisses on input*,
+  and *covers the output / stays on top*. Headless has no display or input
+  device, so these require a real display and are exercised in Stage 2 (and the
+  top-most question remains open regardless — see above).
 
 **Status: outstanding — not yet performed.**
 
@@ -186,12 +200,36 @@ guard.** A nested compositor (`mutter --nested` etc.) shares the same GPU, so a
 GSP firmware crash would still take down the host — nesting is not a safe
 substitute.
 
-Procedure: log in to the Blackwell machine **over SSH from a second machine**
+Procedure: log in to the Blackwell machine **over SSH from a second device**
 first, so that if the GPU wedges you can still capture logs, kill the process,
-and reboot remotely.
+and reboot remotely. Even when the display engine dies, the network stack and
+`sshd` keep running (in the original incident the machine still logged for ~2
+minutes), so an SSH session remains usable for recovery.
+
+The "second device" does not have to be another computer:
+
+- **A phone or tablet works.** Enable `sshd` on the Blackwell host
+  (`sudo systemctl enable --now ssh`) and SSH in from a phone on the same LAN
+  (Android: Termux; iOS: Blink/Termius). This is the recommended option when no
+  second computer is available.
+- **No second device at all → pre-arm an automatic reboot** as a weaker safety
+  net. Save all work and `sync` first, then schedule an unconditional reboot
+  before launching, and cancel it if howan behaves:
+
+  ```bash
+  sudo systemd-run --on-active=120 systemctl reboot   # auto-reboot in 2 min
+  # ... launch howan (below); if it is fine, cancel with:
+  # sudo systemctl stop run-r<unit>.timer   (the unit name systemd-run printed)
+  ```
+
+  This trades the session (and any unsaved work) for avoiding a hard power-cycle
+  and possible filesystem damage if the display wedges.
+- **A local virtual terminal (Ctrl+Alt+F3) is NOT a recovery channel.** A
+  display-engine / GSP wedge takes the text console down with it (same display
+  hardware), so it cannot be relied on.
 
 ```bash
-# On the second machine, over SSH into the Blackwell host:
+# From the second device, over SSH into the Blackwell host:
 
 # 1. Start capturing the kernel/compositor log in case of a wedge.
 journalctl -f -k -u gdm > /tmp/howan-blackwell.log &
