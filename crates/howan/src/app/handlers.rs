@@ -78,7 +78,10 @@ impl CompositorHandler for HowanApp {
             return;
         }
         self.active_output = Some(output.clone());
-        if self.resize_to_active_output() {
+        // Update the requested size now, but only paint once the surface has
+        // been configured — committing a buffer before the first configure is
+        // a protocol error (see `HowanApp::configured`).
+        if self.resize_to_active_output() && self.configured {
             self.draw();
         }
     }
@@ -106,8 +109,9 @@ impl OutputHandler for HowanApp {
     ) {
         // Output geometry may only become available after startup. Once it is,
         // size the surface to it (falls back to the first output until a
-        // surface-enter event picks the real active one).
-        if self.resize_to_active_output() {
+        // surface-enter event picks the real active one). Paint only after the
+        // first configure (see `HowanApp::configured`).
+        if self.resize_to_active_output() && self.configured {
             self.draw();
         }
     }
@@ -119,8 +123,8 @@ impl OutputHandler for HowanApp {
         _output: wl_output::WlOutput,
     ) {
         // The active output's mode may change (e.g. resolution switch); follow
-        // it.
-        if self.resize_to_active_output() {
+        // it. Paint only after the first configure (see `HowanApp::configured`).
+        if self.resize_to_active_output() && self.configured {
             self.draw();
         }
     }
@@ -148,6 +152,9 @@ impl WindowHandler for HowanApp {
         configure: WindowConfigure,
         _serial: u32,
     ) {
+        // The surface is now configured; painting (attach + commit) is allowed
+        // from here on, including from later output/seat events.
+        self.configured = true;
         // Prefer the active output's mode size — that is the size we actually
         // want to cover now that we no longer call `set_fullscreen`. If the
         // output geometry is not yet known, fall back to the compositor's

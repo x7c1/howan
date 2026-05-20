@@ -1,10 +1,12 @@
-//! Composited Wayland window that covers the active output and exits on the
-//! first input event.
+//! The composited Wayland saver window (`howan start`) — covers the active
+//! output and exits on the first input event.
 //!
 //! The application binds the minimum set of Wayland globals required for an
 //! output-sized xdg-shell window, paints a single solid-black `wl_shm` buffer,
 //! and toggles an exit flag the first time the user produces any keyboard,
-//! pointer, or touch input.
+//! pointer, or touch input. The same exit flag is also set by a `SIGTERM` /
+//! `SIGINT` handler (how `howan stop` asks the saver to quit; see
+//! `docs/guides/20-swayidle.md`), so every shutdown path is identical.
 //!
 //! # Why no `set_fullscreen`
 //!
@@ -38,6 +40,7 @@ mod render;
 use std::error::Error;
 use std::time::Duration;
 
+use calloop::signals::{Signal, Signals};
 use smithay_client_toolkit::{
     compositor::CompositorState,
     output::OutputState,
@@ -62,6 +65,7 @@ use wayland_client::{
 };
 
 use self::render::Renderer;
+use crate::pidfile::PidFileGuard;
 
 /// Pre-configure starting size for the shm pool, never the intended final
 /// size. The window is resized to the active output's current mode dimensions
@@ -73,8 +77,15 @@ const INITIAL_HEIGHT: u32 = 720;
 /// exit flag is observed quickly after an input event is processed.
 const DISPATCH_TIMEOUT: Duration = Duration::from_millis(16);
 
-/// Run the M1 application. Blocks until the user dismisses the window.
+/// Run the saver (`howan start`). Blocks until the user dismisses the window,
+/// the compositor closes it, or a `SIGTERM`/`SIGINT` (e.g. from `howan stop`)
+/// arrives.
 pub fn run() -> Result<(), Box<dyn Error>> {
+    // Publish our PID before opening the window so `howan stop` can reach us
+    // for the entire visible lifetime. The guard removes the file on every
+    // exit path, including an early `?` return below.
+    let _pid_guard = PidFileGuard::acquire()?;
+
     let conn = Connection::connect_to_env()?;
     let (globals, event_queue) = registry_queue_init(&conn)?;
     let qh = event_queue.handle();
@@ -82,8 +93,21 @@ pub fn run() -> Result<(), Box<dyn Error>> {
     let mut event_loop: EventLoop<HowanApp> = EventLoop::try_new()?;
     let loop_handle = event_loop.handle();
     WaylandSource::new(conn.clone(), event_queue)
-        .insert(loop_handle)
+        .insert(loop_handle.clone())
         .map_err(|err| format!("failed to insert wayland source into event loop: {err}"))?;
+
+    // SIGTERM is how `howan stop` (the swayidle `resume` hook) asks us to quit;
+    // SIGINT covers Ctrl-C in an interactive run. Both are routed through the
+    // event loop via a signalfd and set the same `exit` flag the input handlers
+    // toggle, so shutdown unwinds the existing clean-exit path (input handles
+    // released, PID file removed) instead of aborting mid-frame.
+    let signals = Signals::new(&[Signal::SIGTERM, Signal::SIGINT])
+        .map_err(|err| format!("failed to register signal handler: {err}"))?;
+    loop_handle
+        .insert_source(signals, |_event, _metadata, app: &mut HowanApp| {
+            app.dismiss();
+        })
+        .map_err(|err| format!("failed to insert signal source into event loop: {err}"))?;
 
     let compositor = CompositorState::bind(&globals, &qh)
         .map_err(|err| format!("wl_compositor not available: {err}"))?;
@@ -149,6 +173,7 @@ pub fn run() -> Result<(), Box<dyn Error>> {
         pointer: None,
         touch: None,
         active_output: None,
+        configured: false,
         exit: false,
     };
 
@@ -184,6 +209,12 @@ pub(crate) struct HowanApp {
     /// surface entered (M1 "active output only"); until a surface-enter event
     /// arrives we fall back to the first advertised output.
     pub(crate) active_output: Option<WlOutput>,
+    /// Set once the xdg surface has received its first configure. We must not
+    /// attach a buffer and commit before that (xdg-shell forbids committing a
+    /// buffer to a surface that has never been configured); output/seat events
+    /// can otherwise trigger `draw()` too early. Strict compositors (e.g.
+    /// `weston`) reject the premature commit; Mutter tolerates it.
+    pub(crate) configured: bool,
     pub(crate) exit: bool,
 }
 
