@@ -187,7 +187,14 @@ What a headless run can and cannot confirm:
   device, so these require a real display and are exercised in Stage 2 (and the
   top-most question remains open regardless — see above).
 
-**Status: outstanding — not yet performed.**
+**Status: PASSED (protocol level), 2026-05-21.** Verified against a headless
+`weston` 14 with the pixman (CPU) renderer, advertising a 1920×1080 output. The
+`WAYLAND_DEBUG` wire trace showed howan send **no** `xdg_toplevel.set_fullscreen`
+and **no** `wl_surface.set_opaque_region`; it created an ordinary `xdg_toplevel`
+and pinned `set_min_size`/`set_max_size` to `1920×1080`, matching the advertised
+`wl_output.mode`, then committed a buffer. The visual/input aspects (visible,
+dismiss-on-input, coverage/top-most) were not exercised — they require a real
+display and fall to Stage 2.
 
 ### Stage 2 — Blackwell sign-off (SSH-guarded)
 
