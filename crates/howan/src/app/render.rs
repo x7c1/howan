@@ -1,17 +1,22 @@
 //! Solid-color SHM renderer.
 //!
-//! Allocates and caches a single ARGB8888 buffer filled with opaque black,
-//! reallocating only when the surface size changes. M1 has no per-frame
-//! redraw needs because the contents never change; the renderer attaches the
-//! buffer on each configure callback.
+//! Paints a single ARGB8888 buffer filled with opaque black covering the whole
+//! surface. `render` is event-driven (configure / output changes / each saver
+//! show), not a per-frame loop, because the contents never change.
+//!
+//! Each `render` acquires a buffer from the `SlotPool` rather than caching and
+//! re-attaching one fixed buffer. The pool reuses any slot the compositor has
+//! released and only allocates another when none is free, which gives correct
+//! double-buffering: if `render` is called again before the compositor releases
+//! the previously attached buffer, we paint into a second slot instead of
+//! re-attaching the still-active one. Re-attaching an active buffer is a
+//! protocol error (`wl_buffer` "already active") — the daemon's repeated
+//! show/redraw cycles surfaced exactly that when a single buffer was cached.
 //!
 //! Carved out from the rest of the app so the boundary is obvious when a
 //! later milestone replaces this with a GPU-backed renderer.
 
-use smithay_client_toolkit::shm::{
-    slot::{Buffer, SlotPool},
-    Shm, ShmHandler,
-};
+use smithay_client_toolkit::shm::{slot::SlotPool, Shm, ShmHandler};
 use wayland_client::protocol::{wl_shm, wl_surface::WlSurface};
 
 use super::HowanApp;
@@ -20,7 +25,6 @@ pub(crate) struct Renderer {
     pool: SlotPool,
     width: u32,
     height: u32,
-    buffer: Option<Buffer>,
 }
 
 impl Renderer {
@@ -40,7 +44,6 @@ impl Renderer {
             pool,
             width: initial_width,
             height: initial_height,
-            buffer: None,
         })
     }
 
@@ -52,60 +55,45 @@ impl Renderer {
         self.height
     }
 
-    /// Adopt a new surface size. Invalidates the cached buffer so the next
-    /// `render` call reallocates.
+    /// Adopt a new surface size. The next `render` allocates a buffer at the
+    /// new dimensions from the pool.
     pub(crate) fn resize(&mut self, width: u32, height: u32) {
-        if width != self.width || height != self.height {
-            self.width = width;
-            self.height = height;
-            self.buffer = None;
-        }
+        self.width = width;
+        self.height = height;
     }
 
-    /// Paint a single solid-black buffer covering the entire surface, damage
-    /// the surface, and attach the buffer. The caller is responsible for the
+    /// Paint a fresh solid-black buffer covering the entire surface, damage the
+    /// surface, and attach the buffer. The caller is responsible for the
     /// `wl_surface.commit` that flushes the change to the compositor.
+    ///
+    /// A new buffer is taken from the pool on every call (the pool reuses a
+    /// released slot when one is free), so we never re-attach a buffer the
+    /// compositor still holds — which would fail with `wl_buffer` "already
+    /// active".
     pub(crate) fn render(&mut self, surface: &WlSurface) {
         let width = self.width as i32;
         let height = self.height as i32;
         let stride = width * 4;
 
-        // Reallocate the buffer when the dimensions change. SCTK's `Buffer`
-        // exposes `height()` and `stride()` but not `width()`; we derive
-        // width from stride (4 bytes per ARGB pixel).
-        if let Some(buffer) = &self.buffer {
-            let cached_width = buffer.stride() / 4;
-            if cached_width != width || buffer.height() != height {
-                self.buffer = None;
-            }
-        }
-
-        let buffer = match self.buffer.as_ref() {
-            Some(buffer) => buffer,
-            None => {
-                let (buffer, canvas) =
-                    match self
-                        .pool
-                        .create_buffer(width, height, stride, wl_shm::Format::Argb8888)
-                    {
-                        Ok(pair) => pair,
-                        Err(err) => {
-                            eprintln!("howan: failed to allocate shm buffer: {err}");
-                            return;
-                        }
-                    };
-                // ARGB8888 little-endian layout in memory is [B, G, R, A].
-                // Fully opaque black is `0x00, 0x00, 0x00, 0xFF`.
-                for px in canvas.chunks_exact_mut(4) {
-                    px[0] = 0x00;
-                    px[1] = 0x00;
-                    px[2] = 0x00;
-                    px[3] = 0xFF;
+        let (buffer, canvas) =
+            match self
+                .pool
+                .create_buffer(width, height, stride, wl_shm::Format::Argb8888)
+            {
+                Ok(pair) => pair,
+                Err(err) => {
+                    eprintln!("howan: failed to allocate shm buffer: {err}");
+                    return;
                 }
-                self.buffer = Some(buffer);
-                self.buffer.as_ref().expect("buffer just assigned")
-            }
-        };
+            };
+        // ARGB8888 little-endian layout in memory is [B, G, R, A].
+        // Fully opaque black is `0x00, 0x00, 0x00, 0xFF`.
+        for px in canvas.chunks_exact_mut(4) {
+            px[0] = 0x00;
+            px[1] = 0x00;
+            px[2] = 0x00;
+            px[3] = 0xFF;
+        }
 
         surface.damage_buffer(0, 0, width, height);
         if let Err(err) = buffer.attach_to(surface) {
