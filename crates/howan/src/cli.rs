@@ -45,18 +45,21 @@ pub enum Command {
 /// Arguments for `howan daemon`.
 #[derive(Debug, Parser, PartialEq, Eq)]
 pub struct DaemonArgs {
-    /// Idle threshold T1 in seconds: how long the seat must be idle before the
-    /// saver is shown. Defaults to 300 (5 minutes). Full duration-string /
+    /// How long the seat must be idle, in seconds, before the saver is shown
+    /// (the design's `T1`). Defaults to 300 (5 minutes). Full duration-string /
     /// TOML configuration is a later milestone; this single override is the
     /// only knob for now.
-    #[arg(long = "t1", value_name = "SECONDS")]
-    t1_secs: Option<u64>,
+    #[arg(long = "idle-timeout", value_name = "SECONDS")]
+    idle_timeout_secs: Option<u64>,
 }
 
 impl DaemonArgs {
-    /// The effective `T1`, applying the 5-minute default.
-    pub fn t1(&self) -> Duration {
-        self.t1_secs.map(Duration::from_secs).unwrap_or(DEFAULT_T1)
+    /// The effective idle timeout (the design's `T1`), applying the 5-minute
+    /// default.
+    pub fn idle_timeout(&self) -> Duration {
+        self.idle_timeout_secs
+            .map(Duration::from_secs)
+            .unwrap_or(DEFAULT_T1)
     }
 }
 
@@ -101,20 +104,20 @@ mod tests {
     }
 
     #[test]
-    fn daemon_t1_defaults_to_five_minutes() {
+    fn daemon_idle_timeout_defaults_to_five_minutes() {
         let cli = Cli::parse_from(["howan", "daemon"]);
         let Command::Daemon(args) = cli.into_command() else {
             panic!("expected daemon command");
         };
-        assert_eq!(args.t1(), Duration::from_secs(300));
+        assert_eq!(args.idle_timeout(), Duration::from_secs(300));
     }
 
     #[test]
-    fn daemon_t1_override_is_parsed_in_seconds() {
-        let cli = Cli::parse_from(["howan", "daemon", "--t1", "7"]);
+    fn daemon_idle_timeout_override_is_parsed_in_seconds() {
+        let cli = Cli::parse_from(["howan", "daemon", "--idle-timeout", "7"]);
         let Command::Daemon(args) = cli.into_command() else {
             panic!("expected daemon command");
         };
-        assert_eq!(args.t1(), Duration::from_secs(7));
+        assert_eq!(args.idle_timeout(), Duration::from_secs(7));
     }
 }

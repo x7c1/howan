@@ -16,7 +16,7 @@ cargo build
 
 ```bash
 howan daemon            # resident daemon: detect idle and show the saver autonomously
-howan daemon --t1 60    # override the idle threshold T1 (seconds; default 300)
+howan daemon --idle-timeout 60   # idle seconds before the saver appears (default 300)
 howan start             # show the saver immediately (default when no subcommand is given)
 howan stop              # terminate a running `start` (no-op if none is running)
 ```

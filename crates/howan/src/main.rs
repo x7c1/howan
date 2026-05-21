@@ -27,7 +27,7 @@ use daemon::mutter::MutterIdleSource;
 fn main() -> ExitCode {
     let result = match Cli::parse().into_command() {
         Command::Daemon(args) => {
-            let idle_source = Box::new(MutterIdleSource::new(args.t1()));
+            let idle_source = Box::new(MutterIdleSource::new(args.idle_timeout()));
             app::run_daemon(idle_source)
         }
         Command::Start => app::run(),

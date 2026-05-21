@@ -18,7 +18,7 @@ Key points:
 - Idle detection sits behind an [`IdleSource`](#the-idlesource-seam) trait, so a
   future wlroots `ext-idle-notify-v1` backend can be added without touching the
   daemon loop. Only the GNOME backend exists today.
-- `T1` defaults to 5 minutes and is overridable with `--t1 <seconds>`.
+- `T1` defaults to 5 minutes and is overridable with `--idle-timeout <seconds>`.
 - The manual/debug `howan start` / `howan stop` CLI is unchanged; it is no
   longer the activation path (see [20-swayidle.md](20-swayidle.md)).
 
@@ -43,7 +43,7 @@ lacks `ext-idle-notify-v1` is recorded in [20-swayidle.md](20-swayidle.md).
 ## The daemon model
 
 ```text
-howan daemon --t1 <seconds>
+howan daemon --idle-timeout <seconds>
 ```
 
 1. Connect to Wayland and bind the durable globals (registry, seat, output,
@@ -147,7 +147,7 @@ The deterministic checks below run in the canonical
 
 | Check                                                                 | Result |
 | --------------------------------------------------------------------- | ------ |
-| `howan daemon` subcommand parses; `--t1` overrides the 5-minute default | PASS (unit tests in `cli.rs`) |
+| `howan daemon` subcommand parses; `--idle-timeout` overrides the 5-minute default | PASS (unit tests in `cli.rs`) |
 | Daemon loop consumes idle events through the `IdleSource` trait object  | PASS (fake backend test in `daemon.rs`) |
 | `IdleSource::rearm` is a no-op for the Mutter backend; `T1` → ms        | PASS (unit tests in `mutter.rs`) |
 | `grep -rn set_fullscreen crates/` returns comments only, no call site   | PASS |
@@ -160,40 +160,40 @@ Fast-fail diagnostics (manual, no surface mapped):
 | No Wayland display → exit 1, `Could not find wayland compositor` | PASS |
 | Unreachable session bus → exit 1, clear D-Bus diagnostic         | PASS |
 
+### Buffer reuse fix (found during live verification)
+
+The first live run logged `howan: failed to attach buffer: Buffer was already
+active` once per saver show. The renderer cached a single `wl_shm` buffer and
+re-attached it on every `render`, but `render` fires more than once per show
+(configure plus output events), so it re-attached a buffer the compositor had
+not yet released — a `wl_buffer` protocol error. The single-shot `start` path
+rarely triggered it; the daemon's repeated show/redraw cycles did. Fixed by
+taking a fresh buffer from the `SlotPool` on every `render` (the pool reuses a
+released slot when one is free, giving correct double-buffering); the re-run was
+clean. See `crates/howan/src/app/render.rs`.
+
 ### Stage 1 (safe) — live GNOME idle cycle
 
-**Status: PARTIALLY covered; live idle-cycle re-show is OUTSTANDING.**
+**Status: PASS (2026-05-21).**
 
-The test environment *is* a GNOME / Mutter Wayland session, and the Mutter
-IdleMonitor D-Bus interface is reachable: `howan daemon` armed an idle watch
-without error (a broken bus errors immediately, confirming the reachable case is
-distinct). The deterministic seam/parse coverage above is complete.
-
-What is **not** yet verified deterministically is the full live cycle —
-auto-show after `T1`, input dismiss, auto-show **again** on the next idle, with
-the process staying alive throughout — observed end to end. That requires
-watching the screen across two idle periods, which overlaps with the Blackwell
-display-engine risk below, so it is folded into the SSH-guarded Stage 2 run
-rather than performed casually. **Outstanding gate:** a controlled run that
-visually confirms two consecutive idle → show → dismiss cycles in one daemon
-process.
+On the GNOME / Mutter Wayland session, `howan daemon --idle-timeout 20` was run
+and observed across multiple cycles: the saver auto-appeared after the idle
+period, input dismissed it, and it auto-appeared **again** on the next idle
+period, with the daemon process staying alive throughout (confirmed still
+running after the input dismissals, and a clean `SIGTERM` shutdown). After the
+buffer reuse fix above, the daemon's stderr was empty across the cycles.
 
 ### Stage 2 (Blackwell sign-off, SSH-guarded)
 
-**Status: OUTSTANDING — must be run under an SSH guard before sign-off.**
+**Status: PASS (2026-05-21).**
 
-The target machine is an NVIDIA Blackwell GPU (GeForce RTX 5060 Ti, GB206) and
-the daemon now shows the saver autonomously on real idle. The first autonomous
-run on the actual Blackwell + GNOME/Mutter session must be done **while logged
-in over SSH from a second machine**, so a GPU/display wedge can be recovered
-remotely. This has **not** been performed under those conditions yet and is the
-outstanding gate for declaring the daemon verified on Blackwell. Do **not**
-launch `howan daemon` directly on the Blackwell GUI session without that SSH
-guard.
-
-> Note: a single uncontrolled autonomous run did occur during development on the
-> Blackwell GUI session (a short `--t1` smoke test); the session remained
-> responsive afterwards, consistent with the composited-surface safety design in
-> [30-composited-surface.md](30-composited-surface.md). That is a one-off
-> observation, **not** the SSH-guarded sign-off, and must not be treated as
-> passing Stage 2. The proper SSH-guarded run remains required.
+The target machine is an NVIDIA Blackwell GPU (GeForce RTX 5060 Ti, GB206). The
+daemon was run autonomously on the actual Blackwell + GNOME/Mutter session with
+an out-of-band SSH lifeline from a second device standing by for remote recovery
+(kill / log capture / reboot). Across multiple idle → show → dismiss → re-show
+cycles the display engine was **not** wedged — no GSP / modeset crash symptoms —
+consistent with the composited-surface safety design in
+[30-composited-surface.md](30-composited-surface.md). The buffer reuse fix above
+was made and re-verified within this guarded session. Coverage is the active
+output only (Q2 / multi-output is a later milestone), so a residual top bar is
+expected and not a regression.
