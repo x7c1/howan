@@ -2,12 +2,22 @@
 
 ## Overview
 
-howan does not detect idleness itself. It relies on an external idle watchdog —
+This guide describes the **original** activation design, in which howan did not
+detect idleness itself but relied on an external idle watchdog —
 [`swayidle`](https://github.com/swaywm/swayidle), which implements the
-`ext-idle-notify-v1` protocol — to decide *when* the screen has been idle and to
-invoke howan accordingly. This guide documents the exact swayidle invocation
-that drives howan, how the `start`/`stop` lifecycle works, and the result of the
-manual verification against a real GNOME / Mutter Wayland session.
+`ext-idle-notify-v1` protocol — to decide *when* the screen had been idle and to
+invoke howan accordingly. That design is now superseded by the resident daemon
+(see the note below). The guide is retained for the exact swayidle invocation,
+how the `start`/`stop` lifecycle works, and the result of the manual
+verification against a real GNOME / Mutter Wayland session.
+
+> **Superseded:** the swayidle-driven `start`/`stop` activation described here is
+> superseded by the resident daemon (`howan daemon`), which builds idle detection
+> in instead of delegating to swayidle. See
+> [40-resident-daemon.md](40-resident-daemon.md). This document is kept because it
+> records the Q1 finding below — that Mutter lacks `ext-idle-notify-v1` — which is
+> the reason idle detection had to move in-process. The `start`/`stop` CLI itself
+> still works for manual testing.
 
 > **Known limitation:** this swayidle approach does **not** work on GNOME/Mutter
 > — Mutter does not implement the `ext-idle-notify-v1` idle-detection protocol

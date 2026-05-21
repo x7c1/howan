@@ -74,14 +74,17 @@ impl CompositorHandler for HowanApp {
     ) {
         // The compositor tells us which output the surface is shown on. Adopt
         // it as the active output and size the surface to that output's mode.
-        if surface != self.window.wl_surface() {
+        let Some(saver) = self.saver.as_ref() else {
+            return;
+        };
+        if surface != saver.window.wl_surface() {
             return;
         }
         self.active_output = Some(output.clone());
         // Update the requested size now, but only paint once the surface has
         // been configured — committing a buffer before the first configure is
-        // a protocol error (see `HowanApp::configured`).
-        if self.resize_to_active_output() && self.configured {
+        // a protocol error (see `Saver::configured`).
+        if self.resize_to_active_output() && self.saver_configured() {
             self.draw();
         }
     }
@@ -110,8 +113,8 @@ impl OutputHandler for HowanApp {
         // Output geometry may only become available after startup. Once it is,
         // size the surface to it (falls back to the first output until a
         // surface-enter event picks the real active one). Paint only after the
-        // first configure (see `HowanApp::configured`).
-        if self.resize_to_active_output() && self.configured {
+        // first configure (see `Saver::configured`).
+        if self.resize_to_active_output() && self.saver_configured() {
             self.draw();
         }
     }
@@ -123,8 +126,8 @@ impl OutputHandler for HowanApp {
         _output: wl_output::WlOutput,
     ) {
         // The active output's mode may change (e.g. resolution switch); follow
-        // it. Paint only after the first configure (see `HowanApp::configured`).
-        if self.resize_to_active_output() && self.configured {
+        // it. Paint only after the first configure (see `Saver::configured`).
+        if self.resize_to_active_output() && self.saver_configured() {
             self.draw();
         }
     }
@@ -152,9 +155,16 @@ impl WindowHandler for HowanApp {
         configure: WindowConfigure,
         _serial: u32,
     ) {
+        // A configure can race a just-dismissed surface; ignore it if the saver
+        // is already gone.
+        if self.saver.is_none() {
+            return;
+        }
         // The surface is now configured; painting (attach + commit) is allowed
         // from here on, including from later output/seat events.
-        self.configured = true;
+        if let Some(saver) = self.saver.as_mut() {
+            saver.configured = true;
+        }
         // Prefer the active output's mode size — that is the size we actually
         // want to cover now that we no longer call `set_fullscreen`. If the
         // output geometry is not yet known, fall back to the compositor's
@@ -162,17 +172,19 @@ impl WindowHandler for HowanApp {
         // compositor leaves a dimension unset (`None`, encoded as `0` on the
         // wire, meaning "client decides").
         if !self.resize_to_active_output() {
-            let new_width = configure
-                .new_size
-                .0
-                .map(|v| v.get())
-                .unwrap_or_else(|| self.renderer.width());
-            let new_height = configure
-                .new_size
-                .1
-                .map(|v| v.get())
-                .unwrap_or_else(|| self.renderer.height());
-            self.renderer.resize(new_width, new_height);
+            if let Some(saver) = self.saver.as_mut() {
+                let new_width = configure
+                    .new_size
+                    .0
+                    .map(|v| v.get())
+                    .unwrap_or_else(|| saver.renderer.width());
+                let new_height = configure
+                    .new_size
+                    .1
+                    .map(|v| v.get())
+                    .unwrap_or_else(|| saver.renderer.height());
+                saver.renderer.resize(new_width, new_height);
+            }
         }
         self.draw();
     }
@@ -281,8 +293,12 @@ impl PointerHandler for HowanApp {
         // attaching a null surface to the pointer image; Wayland leaves the
         // compositor's default cursor visible otherwise, which is distracting
         // on a blank overlay. Leave / axis events are ignored.
+        let saver_surface = match self.saver.as_ref() {
+            Some(saver) => saver.window.wl_surface().clone(),
+            None => return,
+        };
         for event in events {
-            if event.surface != *self.window.wl_surface() {
+            if event.surface != saver_surface {
                 continue;
             }
             match event.kind {

@@ -26,3 +26,10 @@ clap = { version = "4", features = ["derive"] }
 # `howan stop`. Already in the tree transitively; declared directly here so the
 # unsafe FFI calls have a first-class dependency.
 libc = "0.2"
+# D-Bus client for the GNOME idle backend. The resident daemon talks to
+# `org.gnome.Mutter.IdleMonitor` on the session bus to learn when the seat has
+# been idle for T1 (Mutter does not implement `ext-idle-notify-v1`, so swayidle
+# cannot be used on GNOME — see docs/guides/40-resident-daemon.md). We use the
+# blocking API on a dedicated thread and forward idle events into the calloop
+# loop, so no async runtime is pulled into the Wayland thread.
+zbus = "5"

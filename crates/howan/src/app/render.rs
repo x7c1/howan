@@ -17,7 +17,6 @@ use wayland_client::protocol::{wl_shm, wl_surface::WlSurface};
 use super::HowanApp;
 
 pub(crate) struct Renderer {
-    shm: Shm,
     pool: SlotPool,
     width: u32,
     height: u32,
@@ -25,17 +24,19 @@ pub(crate) struct Renderer {
 }
 
 impl Renderer {
+    /// Build a renderer with its own `wl_shm` pool. The pool only needs the
+    /// `Shm` global at construction time; `HowanApp` retains the `Shm` so it
+    /// can build a fresh renderer for each idle cycle without it being `Clone`.
     pub(crate) fn new(
-        shm: Shm,
+        shm: &Shm,
         initial_width: u32,
         initial_height: u32,
     ) -> Result<Self, Box<dyn std::error::Error>> {
         // Pre-size the pool for one full ARGB8888 buffer at the initial dimensions.
         // The pool grows on demand when the compositor configures a larger size.
         let pool_size = (initial_width * initial_height * 4) as usize;
-        let pool = SlotPool::new(pool_size, &shm)?;
+        let pool = SlotPool::new(pool_size, shm)?;
         Ok(Self {
-            shm,
             pool,
             width: initial_width,
             height: initial_height,
@@ -111,14 +112,10 @@ impl Renderer {
             eprintln!("howan: failed to attach buffer: {err}");
         }
     }
-
-    pub(crate) fn shm_mut(&mut self) -> &mut Shm {
-        &mut self.shm
-    }
 }
 
 impl ShmHandler for HowanApp {
     fn shm_state(&mut self) -> &mut Shm {
-        self.renderer.shm_mut()
+        &mut self.shm
     }
 }

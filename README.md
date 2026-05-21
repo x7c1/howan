@@ -15,13 +15,20 @@ cargo build
 ## Run
 
 ```bash
-howan start   # launch the saver (default when no subcommand is given)
-howan stop    # terminate a running saver (no-op if none is running)
+howan daemon            # resident daemon: detect idle and show the saver autonomously
+howan daemon --t1 60    # override the idle threshold T1 (seconds; default 300)
+howan start             # show the saver immediately (default when no subcommand is given)
+howan stop              # terminate a running `start` (no-op if none is running)
 ```
 
-howan is meant to be driven by `swayidle`. See
-[docs/guides/20-swayidle.md](docs/guides/20-swayidle.md) for the invocation and
-the start/stop lifecycle.
+`howan daemon` is the primary mode: a long-lived process that detects idle via
+GNOME's `org.gnome.Mutter.IdleMonitor` and shows the saver when the seat has
+been idle for `T1`, staying resident across show/dismiss cycles. See
+[docs/guides/40-resident-daemon.md](docs/guides/40-resident-daemon.md).
+
+`start`/`stop` are kept for manual testing. The earlier swayidle-driven
+activation is superseded by the daemon; see
+[docs/guides/20-swayidle.md](docs/guides/20-swayidle.md).
 
 ## License
 
