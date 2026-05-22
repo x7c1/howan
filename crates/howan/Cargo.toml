@@ -14,6 +14,16 @@ repository = "https://github.com/x7c1/howan"
 # needed.
 smithay-client-toolkit = { version = "0.20", default-features = false, features = ["calloop"] }
 wayland-client = "0.31"
+# `zwp_idle_inhibit_manager_v1` / `zwp_idle_inhibitor_v1` are not in the
+# `wayland-client` core crate; they live in `wayland-protocols` under
+# `wp::idle_inhibit::zv1::client`. The daemon holds an inhibitor on the saver
+# surface for as long as the saver is shown so the compositor does not blank
+# the display (DPMS off) behind it — wake-from-DPMS is multi-second on the
+# target NVIDIA hardware. The zv1 protocols sit behind the `unstable` feature
+# gate; `client` generates the client-side bindings. Pinned to the version
+# resolved alongside `wayland-client = "0.31"`. See
+# docs/guides/40-resident-daemon.md.
+wayland-protocols = { version = "0.32", features = ["client", "unstable"] }
 # Depend on calloop directly (the same version SCTK pulls in) so we can enable
 # its `signals` feature. This gives a `signalfd`-backed event source that
 # delivers SIGTERM/SIGINT through the running event loop, letting us reuse the

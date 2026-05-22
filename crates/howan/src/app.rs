@@ -79,6 +79,10 @@ use wayland_client::{
     },
     Connection, QueueHandle,
 };
+use wayland_protocols::wp::idle_inhibit::zv1::client::{
+    zwp_idle_inhibit_manager_v1::ZwpIdleInhibitManagerV1,
+    zwp_idle_inhibitor_v1::ZwpIdleInhibitorV1,
+};
 
 use self::render::Renderer;
 use crate::daemon::{IdleEvent, IdleSource};
@@ -231,6 +235,12 @@ pub(crate) struct HowanApp {
     /// A handle to the shared event queue, kept so idle-channel callbacks (which
     /// receive only `&mut HowanApp`) can create the saver surface on demand.
     qh: QueueHandle<HowanApp>,
+    /// The idle-inhibit manager, bound at startup if the compositor advertises
+    /// `zwp_idle_inhibit_manager_v1`; `None` when the global is absent. Used to
+    /// create an inhibitor on the saver surface (see [`Saver`]); the
+    /// degrade-gracefully-on-absence rationale lives at the bind site in
+    /// `HowanApp::new`.
+    idle_inhibit_manager: Option<ZwpIdleInhibitManagerV1>,
     /// The on-screen saver, present only while the saver is shown.
     pub(crate) saver: Option<Saver>,
     pub(crate) keyboard: Option<WlKeyboard>,
@@ -262,6 +272,18 @@ pub(crate) struct Saver {
     /// can otherwise trigger `draw()` too early. Strict compositors (e.g.
     /// `weston`) reject the premature commit; Mutter tolerates it.
     pub(crate) configured: bool,
+    /// The idle inhibitor held against this saver's `wl_surface` for as long as
+    /// the saver is shown, so the compositor does not blank the display (DPMS
+    /// off) behind it. `None` when the idle-inhibit manager global was absent at
+    /// startup.
+    ///
+    /// Released in [`Saver`]'s `Drop` impl, which explicitly sends
+    /// `zwp_idle_inhibitor_v1.destroy`. This **must** be explicit:
+    /// `wayland-client` proxies do not send their destructor request when the
+    /// Rust handle is dropped, so without it the inhibitor leaks and Mutter keeps
+    /// treating the session as non-idle even after dismiss — blocking both the
+    /// DPMS resume and the next idle detection (the saver would show only once).
+    inhibitor: Option<ZwpIdleInhibitorV1>,
 }
 
 impl HowanApp {
@@ -278,6 +300,24 @@ impl HowanApp {
         let shm =
             Shm::bind(globals, qh).map_err(|err| format!("wl_shm not available: {err}"))?;
 
+        // Bind the idle-inhibit manager through the existing GlobalList. This is
+        // best-effort: a compositor without the global degrades to "no
+        // inhibitor", and the saver still shows. We log once so the absence is
+        // diagnosable, then keep `None`. Unlike the compositor / xdg / shm
+        // globals above, a missing idle-inhibit manager is *not* fatal — DPMS
+        // suppression is an enhancement to the saver, not a precondition for it.
+        let idle_inhibit_manager = match globals.bind::<ZwpIdleInhibitManagerV1, _, _>(qh, 1..=1, ())
+        {
+            Ok(manager) => Some(manager),
+            Err(err) => {
+                eprintln!(
+                    "howan: idle-inhibit manager unavailable ({err}); \
+                     the saver will still show but the compositor may blank the display behind it"
+                );
+                None
+            }
+        };
+
         Ok(Self {
             registry_state: RegistryState::new(globals),
             seat_state: SeatState::new(globals, qh),
@@ -286,6 +326,7 @@ impl HowanApp {
             xdg_shell,
             shm,
             qh: qh.clone(),
+            idle_inhibit_manager,
             saver: None,
             keyboard: None,
             pointer: None,
@@ -302,7 +343,13 @@ impl HowanApp {
         if self.saver.is_some() {
             return;
         }
-        match Saver::new(&self.compositor, &self.xdg_shell, &self.shm, qh) {
+        match Saver::new(
+            &self.compositor,
+            &self.xdg_shell,
+            &self.shm,
+            self.idle_inhibit_manager.as_ref(),
+            qh,
+        ) {
             Ok(saver) => self.saver = Some(saver),
             Err(err) => eprintln!("howan: failed to create saver surface: {err}"),
         }
@@ -447,10 +494,18 @@ impl Saver {
     /// The shm buffer is still filled with opaque-black pixels (alpha 0xFF) for
     /// appearance — that is a separate thing from declaring an opaque *region*
     /// on the surface, and only the latter governs Mutter's scanout eligibility.
+    ///
+    /// When `idle_inhibit_manager` is `Some`, an inhibitor is created against
+    /// this saver's `wl_surface` and stored on the returned `Saver` (see the
+    /// `inhibitor` field for its surface-bound lifetime). The inhibitor becomes
+    /// effective once the surface maps (per the protocol), so creating it here —
+    /// before the first configure — is fine. When the manager is `None` the
+    /// saver is created without an inhibitor and shows normally.
     fn new(
         compositor: &CompositorState,
         xdg_shell: &XdgShell,
         shm: &Shm,
+        idle_inhibit_manager: Option<&ZwpIdleInhibitManagerV1>,
         qh: &QueueHandle<HowanApp>,
     ) -> Result<Self, Box<dyn Error>> {
         let surface = compositor.create_surface(qh);
@@ -469,10 +524,83 @@ impl Saver {
         window.commit();
 
         let renderer = Renderer::new(shm, INITIAL_WIDTH, INITIAL_HEIGHT)?;
+
+        // Hold an idle inhibitor against the saver surface so the compositor does
+        // not blank the display behind it. When the manager is `None` (global
+        // absent) `make_inhibitor` produces `None` without any Wayland call — see
+        // its unit test.
+        let inhibitor = make_inhibitor(idle_inhibit_manager, |manager| {
+            manager.create_inhibitor(window.wl_surface(), qh, ())
+        });
+
         Ok(Self {
             window,
             renderer,
             configured: false,
+            inhibitor,
         })
+    }
+}
+
+impl Drop for Saver {
+    /// Explicitly destroy the idle inhibitor before the surface is torn down.
+    ///
+    /// `wayland-client` does **not** send a proxy's destructor request when the
+    /// Rust handle is dropped, so the inhibitor must be destroyed by hand.
+    /// Without this, Mutter keeps the session inhibited after dismiss and never
+    /// reports the next idle period — the saver shows only once. Sending
+    /// `destroy` here, before the `window` field drops and tears down the
+    /// surface, releases the inhibitor in the protocol-correct order; the
+    /// request is flushed on the daemon's next event-loop dispatch.
+    fn drop(&mut self) {
+        if let Some(inhibitor) = self.inhibitor.take() {
+            inhibitor.destroy();
+        }
+    }
+}
+
+/// Decide whether to create an idle inhibitor: `Some` only when a manager is
+/// present, in which case `create` is invoked exactly once to build it.
+///
+/// This isolates the graceful-degradation rule — "no manager ⇒ no inhibitor,
+/// no Wayland call, no panic" — from the live `create_inhibitor` round-trip
+/// (which cannot run in CI), so it can be unit-tested. It is a thin wrapper over
+/// `Option::map`; the value is that the absent-manager path is exercised by a
+/// test rather than only by inspection.
+fn make_inhibitor<M, I, F>(manager: Option<&M>, create: F) -> Option<I>
+where
+    F: FnOnce(&M) -> I,
+{
+    manager.map(create)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::make_inhibitor;
+
+    /// When the idle-inhibit manager is absent, no inhibitor is created and the
+    /// `create` closure is never called — the daemon must still show the saver,
+    /// so this path must not panic or attempt a Wayland call. Mirrors the
+    /// `Saver::new` site where `idle_inhibit_manager` is `None`.
+    #[test]
+    fn make_inhibitor_returns_none_without_manager_and_does_not_invoke_create() {
+        let manager: Option<&()> = None;
+        let inhibitor = make_inhibitor(manager, |_unit| -> u32 {
+            panic!("create must not be called when the manager is absent");
+        });
+        assert!(inhibitor.is_none());
+    }
+
+    /// When a manager is present, the inhibitor is created exactly once.
+    #[test]
+    fn make_inhibitor_creates_once_with_manager() {
+        let manager = ();
+        let mut calls = 0;
+        let inhibitor = make_inhibitor(Some(&manager), |_unit| {
+            calls += 1;
+            42_u32
+        });
+        assert_eq!(inhibitor, Some(42));
+        assert_eq!(calls, 1);
     }
 }

@@ -21,6 +21,10 @@ Key points:
 - `T1` defaults to 5 minutes and is overridable with `--idle-timeout <seconds>`.
 - The manual/debug `howan start` / `howan stop` CLI is unchanged; it is no
   longer the activation path (see [20-swayidle.md](20-swayidle.md)).
+- While the saver is shown the daemon holds a `zwp_idle_inhibit_manager_v1`
+  inhibitor on the saver surface so the compositor does not blank the display
+  (DPMS off) behind it (see [Suppressing DPMS while the saver is
+  shown](#suppressing-dpms-while-the-saver-is-shown)).
 
 The composited-surface invariants the saver relies on (no `set_fullscreen`, no
 opaque region — the Blackwell safety rationale) are **not** repeated here; see
@@ -125,11 +129,18 @@ the crate.
 - **Re-arm strategy.** `AddIdleWatch(interval_ms)` is one-shot — it fires
   `WatchFired(id)` once when the seat has been idle for `interval_ms` and does
   **not** re-fire on later idle periods. To get an event on *every* idle period
-  the backend thread runs a small state machine: on the idle watch firing it
-  emits `IdleEvent::Idle` and adds an `AddUserActiveWatch`; when that fires (the
-  user returned and dismissed the saver) it adds a fresh `AddIdleWatch`. The
-  loop repeats indefinitely, so the daemon's `IdleSource::rearm` is a no-op for
-  this backend.
+  the backend thread re-adds an idle watch after each cycle, driven by the
+  daemon: on the idle watch firing it emits `IdleEvent::Idle`, then blocks until
+  the daemon calls `IdleSource::rearm` (which the daemon does after the saver is
+  dismissed and its idle inhibitor released), then adds a fresh `AddIdleWatch`.
+  The backend deliberately does **not** use `AddUserActiveWatch` to re-arm: while
+  the saver is shown the daemon holds an idle inhibitor (see "Suppressing DPMS
+  while the saver is shown"), which makes Mutter treat the session as non-idle
+  and blinds its idle/active tracking — a user-active watch armed under the
+  inhibitor does not fire on the real dismiss, so the saver would show once and
+  never reappear. You cannot both inhibit idle and detect idle through the same
+  Mutter IdleMonitor at once; the daemon, which knows exactly when the saver was
+  dismissed, drives the re-arm instead.
 - **Mid-run failures.** Once the watch loop is running, an error on the backend
   thread (the D-Bus connection dropping, or a `WatchFired` subscription / watch
   re-arm failing) ends the loop and logs `howan: Mutter idle watch loop ended:
@@ -140,6 +151,53 @@ the crate.
   startup, so an unreachable bus at launch instead fails fast with a non-zero
   exit (see "Reachability probe" above).
 
+## Suppressing DPMS while the saver is shown
+
+While the saver is up, nothing in the daemon would otherwise stop the
+compositor's own idle timer from physically blanking the display (DPMS off).
+On the target NVIDIA hardware wake-from-DPMS takes several seconds — exactly the
+latency howan exists to avoid. So for as long as the saver is shown the daemon
+holds an idle inhibitor, keeping the screen physically on behind the saver; the
+first input then brings the desktop back instantly.
+
+- **Protocol.** The daemon uses `zwp_idle_inhibit_manager_v1` /
+  `zwp_idle_inhibitor_v1` (idle *inhibit*) — not `ext-idle-notify-v1` (idle
+  *detection*, which Mutter does not implement; see "Why idle detection is built
+  in"). Mutter **does** advertise the idle-inhibit manager, so suppression works
+  on the primary target with no extra moving parts. The objects are event-less.
+- **Lifetime tied to the surface.** The manager is bound once at startup; the
+  inhibitor is created against the saver's `wl_surface` at the saver's
+  construction site and stored on the `Saver`. `Saver`'s `Drop` impl
+  **explicitly** sends `zwp_idle_inhibitor_v1.destroy` on dismiss, letting the
+  compositor's idle timer resume. This must be explicit: `wayland-client` does
+  not send a proxy's destructor request when the Rust handle is dropped, so a
+  "rely on `Drop`" approach leaks the inhibitor — Mutter then keeps the session
+  inhibited after dismiss and never reports the next idle period (the saver
+  shows only once). With the explicit destroy the inhibitor is held *exactly*
+  while the saver is on screen.
+- **Graceful degradation.** If the idle-inhibit manager global is absent (a
+  compositor that does not advertise it), the daemon logs a single diagnostic to
+  stderr at startup and continues to show the saver **without** an inhibitor — it
+  does not panic or exit. DPMS suppression is an enhancement to the saver, not a
+  precondition for it.
+- **Surface invariants unchanged.** This is a purely additive protocol object on
+  the same non-fullscreen, non-opaque surface; it does not touch
+  `set_fullscreen` or opaque regions and does not change the surface's
+  scanout eligibility. The Blackwell safety rationale is unchanged — see
+  [30-composited-surface.md](30-composited-surface.md).
+
+This re-evaluates the open Q1 question: whether Mutter actually honors an
+inhibitor created for a non-fullscreen, composited (possibly title-barred)
+surface. The on-hardware results are recorded in [DPMS-suppression
+stages](#dpms-suppression-stages) below.
+
+A concrete interaction surfaced here: holding the inhibitor makes Mutter treat
+the session as non-idle, which blinds its `IdleMonitor`. You therefore cannot
+both inhibit idle and detect the *next* idle through that one interface — so the
+backend re-arms idle detection from the dismiss event rather than from a Mutter
+user-active watch (see "Re-arm strategy"). DPMS suppression itself is unaffected:
+the inhibitor is held only while the saver is shown.
+
 ## Verification
 
 The deterministic checks below run in the canonical
@@ -149,9 +207,10 @@ The deterministic checks below run in the canonical
 | --------------------------------------------------------------------- | ------ |
 | `howan daemon` subcommand parses; `--idle-timeout` overrides the 5-minute default | PASS (unit tests in `cli.rs`) |
 | Daemon loop consumes idle events through the `IdleSource` trait object  | PASS (fake backend test in `daemon.rs`) |
-| `IdleSource::rearm` is a no-op for the Mutter backend; `T1` → ms        | PASS (unit tests in `mutter.rs`) |
+| `IdleSource::rearm` before `start` is a benign no-op; `T1` → ms         | PASS (unit tests in `mutter.rs`) |
 | `grep -rn set_fullscreen crates/` returns comments only, no call site   | PASS |
 | No opaque region is declared on the (re)created surface                 | PASS (by inspection of `Saver::new`) |
+| Absent idle-inhibit manager ⇒ no inhibitor, no panic                    | PASS (unit test in `app.rs`) |
 
 Fast-fail diagnostics (manual, no surface mapped):
 
@@ -197,3 +256,72 @@ consistent with the composited-surface safety design in
 was made and re-verified within this guarded session. Coverage is the active
 output only (Q2 / multi-output is a later milestone), so a residual top bar is
 expected and not a regression.
+
+## DPMS-suppression stages
+
+These cover the idle-inhibit behavior added for [Suppressing DPMS while the
+saver is shown](#suppressing-dpms-while-the-saver-is-shown). They are
+on-hardware checks; the deterministic absent-manager path is covered by the unit
+test above.
+
+### DPMS Stage 1 (GNOME) — DPMS suppressed while the saver is shown
+
+**Status: PASS (2026-05-23).**
+
+On a GNOME session, set a short GNOME blank/idle timeout (e.g.
+`org.gnome.desktop.session idle-delay` to ~30s) and run `howan daemon` with a
+short `--idle-timeout` (a few seconds). After the saver auto-appears, leave the
+machine idle past the GNOME blank timeout and confirm the display **stays
+physically on** (no DPMS off) for as long as the saver is up. This answers the
+open Q1 question of whether Mutter honors an inhibitor created for a
+non-fullscreen, composited (possibly title-barred) surface. Then dismiss the
+saver with input and confirm the compositor's normal idle blanking resumes —
+i.e. leaving the machine idle now lets the screen blank as usual, proving the
+inhibitor's lifetime is bound to the surface, not leaked for the life of the
+daemon.
+
+Observed with `idle-delay = 30` and `howan daemon --idle-timeout 5`:
+
+- The saver appeared after the idle timeout, and the display **stayed physically
+  on** well past the 30s GNOME blank deadline for as long as the saver was up
+  (Q1 answered: Mutter does honor the inhibitor on the composited surface).
+- Input dismissed the saver and the saver **re-appeared on the next idle
+  period**, repeatably across cycles, with the daemon staying resident.
+- After dismiss, with no saver shown, normal GNOME blanking resumed.
+
+Two bugs surfaced and were fixed during this stage (both in the M3 change):
+
+- **Inhibitor leaked on dismiss.** It was held on the assumption that dropping
+  the Rust handle sends `zwp_idle_inhibitor_v1.destroy`, but `wayland-client`
+  proxies do not send destructors on drop. The leaked inhibitor kept Mutter
+  treating the session as non-idle, so the saver showed only once. Fixed by
+  destroying the inhibitor explicitly in `Saver`'s `Drop` (see "Suppressing DPMS
+  while the saver is shown").
+- **Re-arm relied on a Mutter user-active watch**, which the held inhibitor
+  blinds. Re-arm is now driven from the dismiss event instead (see "Re-arm
+  strategy").
+
+### DPMS Stage 2 (Blackwell sign-off)
+
+**Status: PASS (2026-05-23).**
+
+DPMS Stage 1 above was run on the NVIDIA Blackwell + GNOME machine itself, so it
+*is* the Blackwell sign-off: the autonomous composited saver, holding the idle
+inhibitor, showed / suppressed blanking / dismissed / re-showed across cycles
+with **no display-engine wedge**.
+
+No separate SSH-guarded re-run is needed for M3, because M3 introduces no new
+display transition to guard against. The 2026-05-20 wedge was a KMS modeset
+triggered by `set_fullscreen` (Mutter unredirect / direct scanout); that trigger
+was removed in PR #3 and the composited path was already signed off on Blackwell
+under an SSH guard (see the daemon [Stage 2](#stage-2-blackwell-sign-off-ssh-guarded)
+above). M3 only adds an idle-inhibit *policy* object — it does not touch
+`set_fullscreen`, opaque regions, scanout, or any modeset, and "keep the screen
+on" (DPMS suppression) is the *absence* of a display transition, not a new one.
+So there is no M3 crash path to reproduce; the GPU-wedge surface is unchanged
+from the composited path already verified.
+
+The genuinely new display transition — **DPMS off↔on**, when Phase 3 releases the
+inhibitor and lets the compositor blank, then a later input unblanks — arrives
+in **M4** (the 3-phase lifecycle). That is where a fresh SSH-guarded Blackwell
+check has real value and should be done; it is out of scope here.
