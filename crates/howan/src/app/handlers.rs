@@ -24,6 +24,7 @@ use smithay_client_toolkit::{
     },
 };
 use wayland_client::{
+    delegate_noop,
     protocol::{
         wl_keyboard::{self, WlKeyboard},
         wl_output,
@@ -33,6 +34,10 @@ use wayland_client::{
         wl_touch::WlTouch,
     },
     Connection, Dispatch, QueueHandle,
+};
+use wayland_protocols::wp::idle_inhibit::zv1::client::{
+    zwp_idle_inhibit_manager_v1::ZwpIdleInhibitManagerV1,
+    zwp_idle_inhibitor_v1::ZwpIdleInhibitorV1,
 };
 
 use super::HowanApp;
@@ -393,3 +398,10 @@ delegate_touch!(HowanApp);
 delegate_xdg_shell!(HowanApp);
 delegate_xdg_window!(HowanApp);
 delegate_registry!(HowanApp);
+
+// The idle-inhibit objects are event-less: the manager is a pure factory and
+// the inhibitor only carries a `destroy` request. Neither emits events, so they
+// need only no-op dispatch. `ignore` on the manager silences the unused-event
+// lint for a global we bind but whose events we never observe.
+delegate_noop!(HowanApp: ignore ZwpIdleInhibitManagerV1);
+delegate_noop!(HowanApp: ZwpIdleInhibitorV1);
