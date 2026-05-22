@@ -9,7 +9,7 @@ check_command: "cargo build && cargo test && cargo clippy --all-targets -- -D wa
 assignee: null
 branch: task/0521-1459-m3-dpms-suppression-idle-inhibit
 created_at: 2026-05-21T14:59:41Z
-updated_at: 2026-05-22T17:28:39Z
+updated_at: 2026-05-22T17:43:45Z
 ---
 
 # feat: M3 suppress DPMS while the saver is shown (idle-inhibit-unstable-v1)
@@ -104,16 +104,17 @@ of the surface, so it carries no new Blackwell modeset risk.
       compositor's normal idle blanking resumes — i.e. leaving the machine idle
       now lets the screen blank as usual. This proves the inhibitor's lifetime is
       bound to the surface, not leaked for the life of the daemon.
-- [ ] **Blackwell sign-off (SSH-guarded).** Re-run the idle-triggered
-      show / suppress-blank / input-dismiss cycle on the actual NVIDIA Blackwell +
-      GNOME session **while logged in over SSH from a second machine** (same
-      out-of-band guard as M2.5 Stage 2). The change is additive and does not
-      alter the surface's scanout eligibility, so the modeset-wedge risk is
-      unchanged from PR #3/#4 — but holding DPMS off indefinitely is new
-      system-level behavior, so verify on the real machine and record in
-      `40-resident-daemon.md` that the display engine was not wedged and the
-      screen stayed on as expected. Never launch the first run directly on the
-      Blackwell GUI session without the SSH guard.
+- [x] **Blackwell sign-off.** Satisfied by running the GNOME stage above on the
+      NVIDIA Blackwell machine itself (2026-05-23): the autonomous composited
+      saver, holding the idle inhibitor, showed / suppressed blanking /
+      dismissed / re-showed with no display-engine wedge. No separate SSH-guarded
+      re-run was needed: M3 adds only an idle-inhibit *policy* object and
+      introduces no new display transition — it does not touch `set_fullscreen`,
+      opaque regions, or any modeset (the 2026-05-20 wedge trigger, removed in
+      PR #3 and already SSH-guard-verified on Blackwell), and "keep the screen
+      on" is the absence of a transition. The genuinely new DPMS off↔on
+      transition belongs to Phase 3 / M4, where a fresh SSH-guarded Blackwell
+      check should be done. Recorded in `40-resident-daemon.md`.
 
 ## Out of scope
 

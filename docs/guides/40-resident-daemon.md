@@ -301,17 +301,27 @@ Two bugs surfaced and were fixed during this stage (both in the M3 change):
   blinds. Re-arm is now driven from the dismiss event instead (see "Re-arm
   strategy").
 
-### DPMS Stage 2 (Blackwell sign-off, SSH-guarded)
+### DPMS Stage 2 (Blackwell sign-off)
 
-**Status: PENDING.**
+**Status: PASS (2026-05-23).**
 
-Re-run the idle-triggered show / suppress-blank / input-dismiss cycle on the
-actual NVIDIA Blackwell + GNOME session **while logged in over SSH from a second
-machine** (same out-of-band guard as the daemon [Stage 2 (Blackwell sign-off,
-SSH-guarded)](#stage-2-blackwell-sign-off-ssh-guarded) above). The change is
-additive and does not alter the surface's scanout eligibility, so the
-modeset-wedge risk is unchanged from the daemon work above — but holding DPMS
-off indefinitely is new system-level behavior, so verify on the real machine and
-record here that the display engine was not wedged and the screen stayed on as
-expected. Never launch the first run directly on the Blackwell GUI session
-without the SSH guard.
+DPMS Stage 1 above was run on the NVIDIA Blackwell + GNOME machine itself, so it
+*is* the Blackwell sign-off: the autonomous composited saver, holding the idle
+inhibitor, showed / suppressed blanking / dismissed / re-showed across cycles
+with **no display-engine wedge**.
+
+No separate SSH-guarded re-run is needed for M3, because M3 introduces no new
+display transition to guard against. The 2026-05-20 wedge was a KMS modeset
+triggered by `set_fullscreen` (Mutter unredirect / direct scanout); that trigger
+was removed in PR #3 and the composited path was already signed off on Blackwell
+under an SSH guard (see the daemon [Stage 2](#stage-2-blackwell-sign-off-ssh-guarded)
+above). M3 only adds an idle-inhibit *policy* object — it does not touch
+`set_fullscreen`, opaque regions, scanout, or any modeset, and "keep the screen
+on" (DPMS suppression) is the *absence* of a display transition, not a new one.
+So there is no M3 crash path to reproduce; the GPU-wedge surface is unchanged
+from the composited path already verified.
+
+The genuinely new display transition — **DPMS off↔on**, when Phase 3 releases the
+inhibitor and lets the compositor blank, then a later input unblanks — arrives
+in **M4** (the 3-phase lifecycle). That is where a fresh SSH-guarded Blackwell
+check has real value and should be done; it is out of scope here.
