@@ -129,11 +129,18 @@ the crate.
 - **Re-arm strategy.** `AddIdleWatch(interval_ms)` is one-shot — it fires
   `WatchFired(id)` once when the seat has been idle for `interval_ms` and does
   **not** re-fire on later idle periods. To get an event on *every* idle period
-  the backend thread runs a small state machine: on the idle watch firing it
-  emits `IdleEvent::Idle` and adds an `AddUserActiveWatch`; when that fires (the
-  user returned and dismissed the saver) it adds a fresh `AddIdleWatch`. The
-  loop repeats indefinitely, so the daemon's `IdleSource::rearm` is a no-op for
-  this backend.
+  the backend thread re-adds an idle watch after each cycle, driven by the
+  daemon: on the idle watch firing it emits `IdleEvent::Idle`, then blocks until
+  the daemon calls `IdleSource::rearm` (which the daemon does after the saver is
+  dismissed and its idle inhibitor released), then adds a fresh `AddIdleWatch`.
+  The backend deliberately does **not** use `AddUserActiveWatch` to re-arm: while
+  the saver is shown the daemon holds an idle inhibitor (see "Suppressing DPMS
+  while the saver is shown"), which makes Mutter treat the session as non-idle
+  and blinds its idle/active tracking — a user-active watch armed under the
+  inhibitor does not fire on the real dismiss, so the saver would show once and
+  never reappear. You cannot both inhibit idle and detect idle through the same
+  Mutter IdleMonitor at once; the daemon, which knows exactly when the saver was
+  dismissed, drives the re-arm instead.
 - **Mid-run failures.** Once the watch loop is running, an error on the backend
   thread (the D-Bus connection dropping, or a `WatchFired` subscription / watch
   re-arm failing) ends the loop and logs `howan: Mutter idle watch loop ended:
@@ -181,6 +188,13 @@ inhibitor created for a non-fullscreen, composited (possibly title-barred)
 surface. The on-hardware results are recorded in [DPMS-suppression
 stages](#dpms-suppression-stages) below.
 
+A concrete interaction surfaced here: holding the inhibitor makes Mutter treat
+the session as non-idle, which blinds its `IdleMonitor`. You therefore cannot
+both inhibit idle and detect the *next* idle through that one interface — so the
+backend re-arms idle detection from the dismiss event rather than from a Mutter
+user-active watch (see "Re-arm strategy"). DPMS suppression itself is unaffected:
+the inhibitor is held only while the saver is shown.
+
 ## Verification
 
 The deterministic checks below run in the canonical
@@ -190,7 +204,7 @@ The deterministic checks below run in the canonical
 | --------------------------------------------------------------------- | ------ |
 | `howan daemon` subcommand parses; `--idle-timeout` overrides the 5-minute default | PASS (unit tests in `cli.rs`) |
 | Daemon loop consumes idle events through the `IdleSource` trait object  | PASS (fake backend test in `daemon.rs`) |
-| `IdleSource::rearm` is a no-op for the Mutter backend; `T1` → ms        | PASS (unit tests in `mutter.rs`) |
+| `IdleSource::rearm` before `start` is a benign no-op; `T1` → ms         | PASS (unit tests in `mutter.rs`) |
 | `grep -rn set_fullscreen crates/` returns comments only, no call site   | PASS |
 | No opaque region is declared on the (re)created surface                 | PASS (by inspection of `Saver::new`) |
 | Absent idle-inhibit manager ⇒ no inhibitor, no panic                    | PASS (unit test in `app.rs`) |
