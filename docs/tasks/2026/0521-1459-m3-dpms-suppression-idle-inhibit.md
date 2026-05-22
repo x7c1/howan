@@ -9,7 +9,7 @@ check_command: "cargo build && cargo test && cargo clippy --all-targets -- -D wa
 assignee: null
 branch: task/0521-1459-m3-dpms-suppression-idle-inhibit
 created_at: 2026-05-21T14:59:41Z
-updated_at: 2026-05-22T15:15:33Z
+updated_at: 2026-05-22T17:28:39Z
 ---
 
 # feat: M3 suppress DPMS while the saver is shown (idle-inhibit-unstable-v1)
@@ -90,7 +90,7 @@ of the surface, so it carries no new Blackwell modeset risk.
 
 ### Manual / on-hardware (verified by a human before merge)
 
-- [ ] **DPMS is suppressed while the saver is shown (GNOME).** On a GNOME
+- [x] **DPMS is suppressed while the saver is shown (GNOME).** On a GNOME
       session, set a short GNOME blank/idle timeout
       (e.g. `org.gnome.desktop.session idle-delay` to ~30s) and run `howan daemon`
       with a short `--idle-timeout` (a few seconds). After the saver auto-appears,
@@ -99,7 +99,7 @@ of the surface, so it carries no new Blackwell modeset risk.
       re-evaluates the original Q1 concern: that Mutter actually honors an
       inhibitor created for a non-fullscreen, composited (possibly
       title-barred) surface. Record the result in `40-resident-daemon.md`.
-- [ ] **Inhibitor is released on dismiss.** After dismissing the saver with
+- [x] **Inhibitor is released on dismiss.** After dismissing the saver with
       input (so no saver is shown and no inhibitor is held), confirm the
       compositor's normal idle blanking resumes — i.e. leaving the machine idle
       now lets the screen blank as usual. This proves the inhibitor's lifetime is

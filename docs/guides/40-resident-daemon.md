@@ -266,7 +266,7 @@ test above.
 
 ### DPMS Stage 1 (GNOME) — DPMS suppressed while the saver is shown
 
-**Status: PENDING.**
+**Status: PASS (2026-05-23).**
 
 On a GNOME session, set a short GNOME blank/idle timeout (e.g.
 `org.gnome.desktop.session idle-delay` to ~30s) and run `howan daemon` with a
@@ -279,6 +279,27 @@ saver with input and confirm the compositor's normal idle blanking resumes —
 i.e. leaving the machine idle now lets the screen blank as usual, proving the
 inhibitor's lifetime is bound to the surface, not leaked for the life of the
 daemon.
+
+Observed with `idle-delay = 30` and `howan daemon --idle-timeout 5`:
+
+- The saver appeared after the idle timeout, and the display **stayed physically
+  on** well past the 30s GNOME blank deadline for as long as the saver was up
+  (Q1 answered: Mutter does honor the inhibitor on the composited surface).
+- Input dismissed the saver and the saver **re-appeared on the next idle
+  period**, repeatably across cycles, with the daemon staying resident.
+- After dismiss, with no saver shown, normal GNOME blanking resumed.
+
+Two bugs surfaced and were fixed during this stage (both in the M3 change):
+
+- **Inhibitor leaked on dismiss.** It was held on the assumption that dropping
+  the Rust handle sends `zwp_idle_inhibitor_v1.destroy`, but `wayland-client`
+  proxies do not send destructors on drop. The leaked inhibitor kept Mutter
+  treating the session as non-idle, so the saver showed only once. Fixed by
+  destroying the inhibitor explicitly in `Saver`'s `Drop` (see "Suppressing DPMS
+  while the saver is shown").
+- **Re-arm relied on a Mutter user-active watch**, which the held inhibitor
+  blinds. Re-arm is now driven from the dismiss event instead (see "Re-arm
+  strategy").
 
 ### DPMS Stage 2 (Blackwell sign-off, SSH-guarded)
 
