@@ -275,12 +275,14 @@ pub(crate) struct Saver {
     /// The idle inhibitor held against this saver's `wl_surface` for as long as
     /// the saver is shown, so the compositor does not blank the display (DPMS
     /// off) behind it. `None` when the idle-inhibit manager global was absent at
-    /// startup. Tied to the surface's lifetime: dropping the `Saver` on dismiss
-    /// drops this field too, whose `Drop` sends `zwp_idle_inhibitor_v1.destroy`
-    /// and lets the compositor's idle timer resume. No explicit teardown is
-    /// needed, so the show → dismiss → show cycle stays correct for free. Held
-    /// purely for its `Drop`; never read after construction.
-    #[allow(dead_code)]
+    /// startup.
+    ///
+    /// Released in [`Saver`]'s `Drop` impl, which explicitly sends
+    /// `zwp_idle_inhibitor_v1.destroy`. This **must** be explicit:
+    /// `wayland-client` proxies do not send their destructor request when the
+    /// Rust handle is dropped, so without it the inhibitor leaks and Mutter keeps
+    /// treating the session as non-idle even after dismiss — blocking both the
+    /// DPMS resume and the next idle detection (the saver would show only once).
     inhibitor: Option<ZwpIdleInhibitorV1>,
 }
 
@@ -537,6 +539,23 @@ impl Saver {
             configured: false,
             inhibitor,
         })
+    }
+}
+
+impl Drop for Saver {
+    /// Explicitly destroy the idle inhibitor before the surface is torn down.
+    ///
+    /// `wayland-client` does **not** send a proxy's destructor request when the
+    /// Rust handle is dropped, so the inhibitor must be destroyed by hand.
+    /// Without this, Mutter keeps the session inhibited after dismiss and never
+    /// reports the next idle period — the saver shows only once. Sending
+    /// `destroy` here, before the `window` field drops and tears down the
+    /// surface, releases the inhibitor in the protocol-correct order; the
+    /// request is flushed on the daemon's next event-loop dispatch.
+    fn drop(&mut self) {
+        if let Some(inhibitor) = self.inhibitor.take() {
+            inhibitor.destroy();
+        }
     }
 }
 

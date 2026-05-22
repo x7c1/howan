@@ -167,11 +167,14 @@ first input then brings the desktop back instantly.
   on the primary target with no extra moving parts. The objects are event-less.
 - **Lifetime tied to the surface.** The manager is bound once at startup; the
   inhibitor is created against the saver's `wl_surface` at the saver's
-  construction site and stored on the `Saver`. Dropping the `Saver` on dismiss
-  drops the inhibitor, whose `Drop` sends `zwp_idle_inhibitor_v1.destroy` and
-  lets the compositor's idle timer resume. So the inhibitor is held *exactly*
-  while the saver is on screen, with no separate state to keep in sync, and the
-  show → dismiss → show cycle stays correct for free.
+  construction site and stored on the `Saver`. `Saver`'s `Drop` impl
+  **explicitly** sends `zwp_idle_inhibitor_v1.destroy` on dismiss, letting the
+  compositor's idle timer resume. This must be explicit: `wayland-client` does
+  not send a proxy's destructor request when the Rust handle is dropped, so a
+  "rely on `Drop`" approach leaks the inhibitor — Mutter then keeps the session
+  inhibited after dismiss and never reports the next idle period (the saver
+  shows only once). With the explicit destroy the inhibitor is held *exactly*
+  while the saver is on screen.
 - **Graceful degradation.** If the idle-inhibit manager global is absent (a
   compositor that does not advertise it), the daemon logs a single diagnostic to
   stderr at startup and continues to show the saver **without** an inhibitor — it
