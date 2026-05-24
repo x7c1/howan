@@ -16,7 +16,9 @@ cargo build
 
 ```bash
 howan daemon            # resident daemon: detect idle and show the saver autonomously
-howan daemon --idle-timeout 60   # idle seconds before the saver appears (default 300)
+howan daemon --idle-timeout 60     # idle seconds before the saver appears (default 300)
+howan daemon --grace-timeout 1800  # seconds before input switches to lock-session (default 3600)
+howan daemon --dpms-timeout 3600   # seconds before the daemon hands off to compositor DPMS (default 7200)
 howan start             # show the saver immediately (default when no subcommand is given)
 howan stop              # terminate a running `start` (no-op if none is running)
 ```

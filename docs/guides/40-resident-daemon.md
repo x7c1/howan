@@ -3,11 +3,12 @@
 ## Overview
 
 howan runs as a single **resident daemon** (`howan daemon`) that owns idle
-detection, surface display, and (in later milestones) the phased lifecycle. It
+detection, surface display, and the elapsed-time phased lifecycle (Phase 1
+immediate return / Phase 2 lock-session handoff / Phase 3 DPMS handoff). It
 connects to Wayland once, stays alive with no surface, and shows the saver
-autonomously when the seat has been idle for `T1`. The first input destroys the
-*surface* — not the process — and the daemon re-arms for the next idle period.
-`SIGTERM`/`SIGINT` terminate the whole daemon cleanly.
+autonomously when the seat has been idle for `T1`. Input or the Phase 3 timer
+destroys the *surface* — not the process — and the daemon re-arms for the next
+idle period. `SIGTERM`/`SIGINT` terminate the whole daemon cleanly.
 
 Key points:
 
@@ -25,6 +26,12 @@ Key points:
   inhibitor on the saver surface so the compositor does not blank the display
   (DPMS off) behind it (see [Suppressing DPMS while the saver is
   shown](#suppressing-dpms-while-the-saver-is-shown)).
+- Input is dispatched by the elapsed-time **three-phase lifecycle**: from saver
+  show until `T_grace` input dismisses the saver (Phase 1); from `T_grace` to
+  `T_dpms` input first asks logind to lock the session, then dismisses (Phase
+  2); at `T_dpms` a calloop timer drops the saver and releases the inhibitor
+  so the compositor's own idle blank takes over (Phase 3). See [Phase
+  lifecycle](#phase-lifecycle).
 
 The composited-surface invariants the saver relies on (no `set_fullscreen`, no
 opaque region — the Blackwell safety rationale) are **not** repeated here; see
@@ -57,10 +64,15 @@ howan daemon --idle-timeout <seconds>
    silently.
 3. When the idle source reports the seat has been idle for `T1`, create and map
    the saver surface (the composited black overlay).
-4. On the first keyboard / pointer / touch input, **drop the saver surface** and
-   forget the active output. The durable Wayland state persists. The daemon
-   re-arms the idle source and stays resident.
-5. `SIGTERM`/`SIGINT` set a process-exit flag, releasing the seat input handles
+4. On the first keyboard / pointer / touch input, dispatch by the three-phase
+   lifecycle (see [Phase lifecycle](#phase-lifecycle)): drop the saver surface
+   (Phase 1), or lock the session via logind and then drop it (Phase 2). The
+   durable Wayland state persists. The daemon re-arms the idle source and stays
+   resident.
+5. If the saver stays up past `T_dpms` without input, a calloop timer fires
+   `dpms_handoff()`, which drops the saver surface so the inhibitor is released
+   and the compositor's standard idle blank can take over (Phase 3).
+6. `SIGTERM`/`SIGINT` set a process-exit flag, releasing the seat input handles
    on the way out.
 
 ### Surface lifecycle vs. process lifecycle
@@ -70,9 +82,14 @@ howan daemon --idle-timeout <seconds>
 show → hide → show cycle is repeatable within one process. Two dismiss paths
 deliberately diverge:
 
-- **Input** calls `HowanApp::dismiss()`, which drops only the `Saver` and sets a
-  `pending_rearm` flag. It does **not** set the process-exit flag. The daemon
-  loop observes `pending_rearm`, asks the idle source to re-arm, and continues.
+- **Input** calls `HowanApp::on_input()`, which dispatches by phase (see
+  [Phase lifecycle](#phase-lifecycle)) and eventually calls `dismiss()` —
+  dropping only the `Saver` and setting a `pending_rearm` flag. It does **not**
+  set the process-exit flag. The daemon loop observes `pending_rearm`, asks the
+  idle source to re-arm, and continues.
+- **The Phase 3 timer** calls `HowanApp::dpms_handoff()`, which is functionally
+  equivalent to `dismiss()` — drops the `Saver`, releases the inhibitor, and
+  flags re-arm. The process stays resident.
 - **`SIGTERM`/`SIGINT`** call `HowanApp::request_exit()`, which sets the
   process-exit flag the loop checks. Signals always terminate the whole daemon.
 
@@ -80,6 +97,68 @@ Keeping these on separate flags is what lets input mean "stay resident" while a
 signal means "shut down". The one-shot `howan start` path reuses the same
 `dismiss()` but, having no idle source, simply notices the surface is gone and
 exits.
+
+### Phase lifecycle
+
+The saver has three behavioral phases driven by **how long it has been
+shown** (not how long the seat has been idle — those are different clocks).
+The single source of truth is `Saver::shown_at` (an `Instant` set in
+`Saver::new`); `Saver::phase(now, t_grace, t_dpms)` compares `now -
+shown_at` against the two thresholds and returns `Phase1` / `Phase2` /
+`Phase3`. Boundaries are inclusive on the lower side: exactly at `T_grace`
+we are already in Phase 2, exactly at `T_dpms` we are already in Phase 3
+(matching the `Timer::from_duration(t_dpms)` fire semantics).
+
+- **Phase 1 — immediate return.** From show to `T_grace`. Input dismisses
+  the saver and the daemon re-arms the idle source, same as the M3
+  behavior. This is the common case.
+- **Phase 2 — lock handoff.** From `T_grace` to `T_dpms`. Input calls
+  `org.freedesktop.login1.Session.Lock` on the current session (the D-Bus
+  equivalent of `loginctl lock-session`), then dismisses the saver. The
+  compositor's lock screen takes over from there — howan never draws an
+  auth surface itself (non-goal: no own locker). The lock call is
+  fire-and-forget; if it fails the daemon logs a single `howan: lock-session
+  failed: <cause>` line to stderr and **still proceeds to dismiss** so the
+  user is never left staring at a saver they cannot get out of.
+- **Phase 3 — DPMS handoff.** At `T_dpms`. A calloop `Timer` armed when
+  the saver was shown fires and drops the `Saver`. `Saver`'s `Drop`
+  releases the inhibitor; the compositor's standard idle timer then
+  blanks the display normally. No input is needed; if input *does* arrive
+  the surface is already gone and the daemon's input handlers no-op.
+
+The two thresholds are exposed as CLI flags in seconds: `--grace-timeout
+<SECONDS>` (default 3600, 1 hour) and `--dpms-timeout <SECONDS>` (default
+7200, 2 hours). The daemon rejects `--dpms-timeout` ≤ `--grace-timeout`
+with a non-zero exit before starting, because collapsing the windows would
+silently make Phase 2 unreachable. Full duration-string / TOML
+configuration (e.g. `"60min"`) is a later milestone.
+
+The Phase 3 timer registration lives in `run_daemon`, not in any handler:
+when the saver becomes shown, `run_daemon` calls
+`LoopHandle::insert_source(Timer::from_duration(t_dpms), …)` and keeps the
+`RegistrationToken`; an input dismiss cancels the timer via
+`LoopHandle::remove(token)`, and a fired timer drops itself with
+`TimeoutAction::Drop`. The timer callback invokes
+`HowanApp::dpms_handoff()` — functionally equivalent to `dismiss()`, named
+distinctly so the call site documents the intent and a future post-Phase-3
+re-arm refinement (open question Q4 in the howan plan) can diverge without
+rewiring the timer plumbing.
+
+The session lock call uses `zbus`'s blocking API on the main thread; it is
+a single D-Bus round trip and short enough not to perturb calloop
+dispatch. The session object path is resolved once at daemon startup via
+`org.freedesktop.login1.Manager.GetSession("auto")`, which returns the
+caller's current session without depending on `XDG_SESSION_ID`. If logind
+is unreachable at startup (a non-systemd session), the daemon falls back
+to a no-op locker so it still runs — Phase 2 then behaves like Phase 1,
+which is strictly safer than refusing to start.
+
+The composited-surface invariants from [30-composited-surface.md](30-composited-surface.md)
+and the inhibitor lifetime from [Suppressing DPMS while the saver is
+shown](#suppressing-dpms-while-the-saver-is-shown) are **unchanged** by
+the phase machine: M4 adds no surface flags, no opaque region, and the
+inhibitor is still owned by `Saver` and destroyed by its `Drop` — Phase 3
+just drops the `Saver` earlier than input would have.
 
 ### PID file
 
@@ -211,6 +290,11 @@ The deterministic checks below run in the canonical
 | `grep -rn set_fullscreen crates/` returns comments only, no call site   | PASS |
 | No opaque region is declared on the (re)created surface                 | PASS (by inspection of `Saver::new`) |
 | Absent idle-inhibit manager ⇒ no inhibitor, no panic                    | PASS (unit test in `app.rs`) |
+| `--grace-timeout` / `--dpms-timeout` parse and default to 1h / 2h       | PASS (unit tests in `cli.rs`) |
+| Degenerate `--dpms-timeout ≤ --grace-timeout` is rejected pre-start     | PASS (unit test in `cli.rs`) |
+| `Saver::phase` boundaries (below `T_grace`, at `T_grace`, at `T_dpms`)   | PASS (unit tests in `app.rs`) |
+| `on_input` no-ops when no saver is shown                                | PASS (unit test in `app.rs`) |
+| Phase 2 dismisses even when the locker fails (log + proceed contract)   | PASS (unit test in `app.rs` with a `FailingLocker` stub) |
 
 Fast-fail diagnostics (manual, no surface mapped):
 
@@ -325,3 +409,79 @@ The genuinely new display transition — **DPMS off↔on**, when Phase 3 release
 inhibitor and lets the compositor blank, then a later input unblanks — arrives
 in **M4** (the 3-phase lifecycle). That is where a fresh SSH-guarded Blackwell
 check has real value and should be done; it is out of scope here.
+
+## Phase-lifecycle stages (M4)
+
+These cover the three-phase machine added in M4 (see [Phase
+lifecycle](#phase-lifecycle)). They are on-hardware checks; the boundary and
+decision logic itself is covered by the unit tests above.
+
+### M4 Stage 1 (GNOME) — Phase 1 behavior unchanged
+
+**Status: pending on-hardware verification.**
+
+Run `howan daemon --idle-timeout 5 --grace-timeout 30 --dpms-timeout 120` on a
+GNOME session. After the saver auto-appears, input within ~30s must dismiss it
+and the daemon must re-arm (the saver re-appears on the next idle cycle), same
+as the M3 behavior recorded in [Stage 1
+above](#stage-1-safe--live-gnome-idle-cycle). Record the result here.
+
+### M4 Stage 2 (GNOME) — Phase 2 input invokes the lock screen
+
+**Status: pending on-hardware verification.**
+
+With the same flags as M4 Stage 1, let the saver stay up past 30s (`T_grace`)
+but well under 120s, then input. The GNOME lock screen must appear (proving
+`org.freedesktop.login1.Session.Lock` was honored) and the saver must be
+dismissed. Record the result here.
+
+### M4 Stage 3 (GNOME) — Phase 3 timer releases the inhibitor
+
+**Status: pending on-hardware verification.**
+
+Run `howan daemon --idle-timeout 5 --grace-timeout 30 --dpms-timeout 60` with
+a short GNOME `org.gnome.desktop.session idle-delay` (e.g. 30s) and leave the
+machine idle past 60s without input. At `T_dpms` the saver surface must
+disappear, the inhibitor must be gone, and within the compositor's own idle
+timer the display must physically blank (DPMS off). Confirm by observing the
+panel / wall clock. Record the result here.
+
+### M4 Stage 4 (Blackwell sign-off, SSH-guarded) — DPMS off↔on
+
+**Status: pending on-hardware verification.**
+
+This is the new real-display power transition M4 introduces and the one M3
+deferred (per [DPMS Stage 2 above](#dpms-stage-2-blackwell-sign-off)). On the
+NVIDIA Blackwell + GNOME machine, with an out-of-band SSH lifeline from a
+second device, run the M4 Stage 3 scenario above and confirm:
+
+- DPMS off engages cleanly without wedging the display engine / GSP firmware.
+- The first input after DPMS off wakes the display normally.
+- `journalctl -k` / NVIDIA driver logs show no crash symptoms.
+
+Record the result here; this answers the sign-off the M3 task deferred to M4.
+
+### M4 Stage 5 — Lock-failure fallback (manual injection)
+
+**Status: pending on-hardware verification.**
+
+Two distinct failure paths exist; pick the one that matches what you want to
+verify, because each emits a different diagnostic:
+
+- **Per-call `Lock` failure (the "log + proceed" branch in `on_input`).**
+  Start `howan daemon` while `systemd-logind` is reachable so `build_locker()`
+  picks `LogindLocker`, then break logind out from under the running daemon
+  (e.g. `sudo systemctl stop systemd-logind` after the saver has appeared, or
+  use a polkit / firewall trick to deny the next `Session.Lock` call). Drive
+  Phase 2 input and confirm the daemon logs `howan: lock-session failed:
+  <cause>` to stderr and **still** dismisses the saver — i.e. the user is not
+  stuck. This is the path the unit test with `FailingLocker` exercises in CI.
+- **Startup fallback (`LogindLocker::new()` failure).** Stop `systemd-logind`
+  *before* launching `howan daemon`, or point `DBUS_SYSTEM_BUS_ADDRESS` at an
+  empty stub, so the production locker cannot be constructed. Confirm that at
+  startup the daemon logs `howan: systemd-logind session lock unavailable
+  (<cause>); Phase 2 input will dismiss the saver without locking` and from
+  then on Phase 2 input dismisses silently (no per-call `lock-session failed`
+  line, because the in-process locker is the `NoopLocker` and never errors).
+  This proves the degradation path documented in the Phase lifecycle section
+  above — daemon-still-runs, Phase 2 collapses to Phase 1 behavior.

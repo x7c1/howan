@@ -275,11 +275,12 @@ impl Dispatch<WlKeyboard, ()> for HowanApp {
         _qh: &QueueHandle<Self>,
     ) {
         // The first `Key` event of any kind (press or release) is enough to
-        // count as user input. We treat both states as dismiss triggers
-        // because some compositors deliver a synthetic release for keys held
-        // when focus was acquired; in either case the user has interacted.
+        // count as user input. We treat both states as input triggers because
+        // some compositors deliver a synthetic release for keys held when
+        // focus was acquired; in either case the user has interacted.
+        // `HowanApp::on_input` then dispatches by the current saver phase.
         if let wl_keyboard::Event::Key { .. } = event {
-            state.dismiss();
+            state.on_input();
         }
     }
 }
@@ -292,12 +293,14 @@ impl PointerHandler for HowanApp {
         pointer: &WlPointer,
         events: &[PointerEvent],
     ) {
-        // Any pointer motion or button press dismisses the window — this
-        // matches the traditional screensaver UX where the user expects mere
-        // mouse movement to wake the screen. On Enter we hide the cursor by
-        // attaching a null surface to the pointer image; Wayland leaves the
-        // compositor's default cursor visible otherwise, which is distracting
-        // on a blank overlay. Leave / axis events are ignored.
+        // Any pointer motion or button press counts as input — this matches
+        // the traditional screensaver UX where the user expects mere mouse
+        // movement to wake the screen. The actual response (dismiss, or lock
+        // + dismiss) is decided by `HowanApp::on_input` based on the saver's
+        // current phase. On Enter we hide the cursor by attaching a null
+        // surface to the pointer image; Wayland leaves the compositor's
+        // default cursor visible otherwise, which is distracting on a blank
+        // overlay. Leave / axis events are ignored.
         let saver_surface = match self.saver.as_ref() {
             Some(saver) => saver.window.wl_surface().clone(),
             None => return,
@@ -311,7 +314,7 @@ impl PointerHandler for HowanApp {
                     pointer.set_cursor(serial, None, 0, 0);
                 }
                 PointerEventKind::Motion { .. } | PointerEventKind::Press { .. } => {
-                    self.dismiss();
+                    self.on_input();
                     break;
                 }
                 _ => {}
@@ -332,8 +335,9 @@ impl TouchHandler for HowanApp {
         _id: i32,
         _position: (f64, f64),
     ) {
-        // First touch-down anywhere on the surface dismisses the window.
-        self.dismiss();
+        // First touch-down anywhere on the surface counts as user input;
+        // `HowanApp::on_input` dispatches by the current saver phase.
+        self.on_input();
     }
 
     fn up(
