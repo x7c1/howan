@@ -84,12 +84,16 @@ deliberately diverge:
 
 - **Input** calls `HowanApp::on_input()`, which dispatches by phase (see
   [Phase lifecycle](#phase-lifecycle)) and eventually calls `dismiss()` —
-  dropping only the `Saver` and setting a `pending_rearm` flag. It does **not**
-  set the process-exit flag. The daemon loop observes `pending_rearm`, asks the
-  idle source to re-arm, and continues.
-- **The Phase 3 timer** calls `HowanApp::dpms_handoff()`, which is functionally
-  equivalent to `dismiss()` — drops the `Saver`, releases the inhibitor, and
-  flags re-arm. The process stays resident.
+  dropping only the `Saver` and setting a `pending_rearm` intent of
+  `Immediate`. It does **not** set the process-exit flag. The daemon loop
+  observes the pending intent, asks the idle source to re-arm via `rearm()`,
+  and continues.
+- **The Phase 3 timer** calls `HowanApp::dpms_handoff()`, which also drops
+  the `Saver` (releasing the inhibitor) but sets the re-arm intent to
+  `AfterActive` so the daemon loop calls `rearm_after_active()` instead.
+  This gates the next idle watch on a user-active transition — see
+  [Post-Phase-3 handoff](#post-phase-3-handoff-active-watch-gate). The
+  process stays resident.
 - **`SIGTERM`/`SIGINT`** call `HowanApp::request_exit()`, which sets the
   process-exit flag the loop checks. Signals always terminate the whole daemon.
 
@@ -125,6 +129,9 @@ we are already in Phase 2, exactly at `T_dpms` we are already in Phase 3
   releases the inhibitor; the compositor's standard idle timer then
   blanks the display normally. No input is needed; if input *does* arrive
   the surface is already gone and the daemon's input handlers no-op.
+  After the handoff the daemon does **not** arm a fresh idle watch right
+  away — see [Post-Phase-3
+  handoff](#post-phase-3-handoff-active-watch-gate) below for why.
 
 The two thresholds are exposed as CLI flags in seconds: `--grace-timeout
 <SECONDS>` (default 3600, 1 hour) and `--dpms-timeout <SECONDS>` (default
@@ -139,10 +146,11 @@ when the saver becomes shown, `run_daemon` calls
 `RegistrationToken`; an input dismiss cancels the timer via
 `LoopHandle::remove(token)`, and a fired timer drops itself with
 `TimeoutAction::Drop`. The timer callback invokes
-`HowanApp::dpms_handoff()` — functionally equivalent to `dismiss()`, named
-distinctly so the call site documents the intent and a future post-Phase-3
-re-arm refinement (open question Q4 in the howan plan) can diverge without
-rewiring the timer plumbing.
+`HowanApp::dpms_handoff()`, which drops the `Saver` the same way
+`dismiss()` does but flags `RearmIntent::AfterActive` so the daemon's
+post-Phase-3 re-arm is gated on a user-active transition rather than
+firing immediately — see [Post-Phase-3
+handoff](#post-phase-3-handoff-active-watch-gate) for why.
 
 The session lock call uses `zbus`'s blocking API on the main thread; it is
 a single D-Bus round trip and short enough not to perturb calloop
@@ -159,6 +167,35 @@ shown](#suppressing-dpms-while-the-saver-is-shown) are **unchanged** by
 the phase machine: M4 adds no surface flags, no opaque region, and the
 inhibitor is still owned by `Saver` and destroyed by its `Drop` — Phase 3
 just drops the `Saver` earlier than input would have.
+
+### Post-Phase-3 handoff: active-watch gate
+
+After Phase 3 drops the saver the daemon must not arm a fresh idle watch
+until the user is actually active again. The Phase 1 / Phase 2 input path
+arms a new `AddIdleWatch` immediately because the user just produced input;
+the Phase 3 timer fires *without* any input, so that assumption does not
+hold. The seat is still idle, and howan's `T1` is typically shorter than
+the compositor's own `org.gnome.desktop.session idle-delay`, so an
+immediate re-arm would fire howan's idle watch first, re-show the saver,
+and re-acquire the inhibitor before the compositor's blanker ever reached
+DPMS off — making the Phase 3 handoff functionally a no-op. This was
+recorded as open question Q4 in the howan plan.
+
+The daemon flags the post-Phase-3 re-arm as `RearmIntent::AfterActive`
+rather than `Immediate`, and `run_daemon` calls
+`IdleSource::rearm_after_active` instead of `rearm` for that variant. The
+Mutter backend implements the gate by arming `AddUserActiveWatch` first,
+waiting for it to fire on the next genuine idle→active transition, and
+only then adding the next `AddIdleWatch`. The active-watch is added
+*after* `Saver`'s `Drop` has released the inhibitor, so Mutter's
+idle/active tracking is no longer blinded and the watch fires on real
+user activity. (That blinding is why the input-dismiss path avoids
+`AddUserActiveWatch` — see [Suppressing DPMS while the saver is
+shown](#suppressing-dpms-while-the-saver-is-shown).)
+
+The Phase 1 / Phase 2 input path is unchanged — see
+`IdleSource::rearm`. On-hardware behavior is verified in
+[M4 Stage 3](#m4-stage-3-gnome--phase-3-timer-releases-the-inhibitor).
 
 ### PID file
 
@@ -180,15 +217,22 @@ The daemon loop consumes idle events through the `IdleSource` trait
 pub trait IdleSource {
     fn start(&self, sender: Sender<IdleEvent>) -> Result<Box<dyn IdleHandle>, Box<dyn Error>>;
     fn rearm(&self) -> Result<(), Box<dyn Error>>;
+    fn rearm_after_active(&self) -> Result<(), Box<dyn Error>> { self.rearm() }
 }
 ```
 
 `start` is handed a `calloop::channel::Sender`; the backend forwards
-`IdleEvent::Idle` whenever the seat reaches `T1` idle. `run_daemon` takes a
-`Box<dyn IdleSource>`, so adding a second backend (e.g. wlroots
-`ext-idle-notify-v1`) means writing a new implementation in its own module and
-constructing it in `main` — the loop does not change. That second backend is out
-of scope here; only the GNOME backend is implemented.
+`IdleEvent::Idle` whenever the seat reaches `T1` idle. The two re-arm methods
+split by dismiss path: `rearm` arms the next idle watch immediately (used
+after Phase 1 / Phase 2 input dismiss), while `rearm_after_active` waits for
+a user-active transition first (used after a Phase 3 DPMS handoff — see
+[Post-Phase-3 handoff](#post-phase-3-handoff-active-watch-gate)). The
+default implementation of `rearm_after_active` falls back to `rearm` so
+backends without a user-active signal degrade to the existing behavior.
+`run_daemon` takes a `Box<dyn IdleSource>`, so adding a second backend (e.g.
+wlroots `ext-idle-notify-v1`) means writing a new implementation in its own
+module and constructing it in `main` — the loop does not change. That second
+backend is out of scope here; only the GNOME backend is implemented.
 
 ### GNOME backend: `org.gnome.Mutter.IdleMonitor`
 
@@ -209,17 +253,29 @@ the crate.
   `WatchFired(id)` once when the seat has been idle for `interval_ms` and does
   **not** re-fire on later idle periods. To get an event on *every* idle period
   the backend thread re-adds an idle watch after each cycle, driven by the
-  daemon: on the idle watch firing it emits `IdleEvent::Idle`, then blocks until
-  the daemon calls `IdleSource::rearm` (which the daemon does after the saver is
-  dismissed and its idle inhibitor released), then adds a fresh `AddIdleWatch`.
-  The backend deliberately does **not** use `AddUserActiveWatch` to re-arm: while
-  the saver is shown the daemon holds an idle inhibitor (see "Suppressing DPMS
-  while the saver is shown"), which makes Mutter treat the session as non-idle
-  and blinds its idle/active tracking — a user-active watch armed under the
-  inhibitor does not fire on the real dismiss, so the saver would show once and
-  never reappear. You cannot both inhibit idle and detect idle through the same
-  Mutter IdleMonitor at once; the daemon, which knows exactly when the saver was
-  dismissed, drives the re-arm instead.
+  daemon. The daemon picks one of two re-arm primitives depending on which
+  dismiss path ran (the choice is computed daemon-side and forwarded to the
+  backend as a `RearmKind`):
+    - **`Immediate`** — after a Phase 1 / Phase 2 input dismiss. The user just
+      produced input, so on receiving the signal the backend adds a fresh
+      `AddIdleWatch` right away. This path deliberately does **not** use
+      `AddUserActiveWatch`: while the saver was shown the daemon held an
+      idle inhibitor that blinded Mutter's idle/active tracking, so a
+      user-active watch armed under it never fired and the saver showed
+      once and never reappeared. The daemon, which knows exactly when input
+      dismissed the saver, drives the immediate re-arm instead. (See
+      [Suppressing DPMS while the saver is
+      shown](#suppressing-dpms-while-the-saver-is-shown) for the
+      inhibitor-blinding interaction.)
+    - **`AfterActive`** — after a Phase 3 DPMS handoff. The saver was dropped
+      by the timer *without* any input, so the seat is still idle. The
+      backend first adds an `AddUserActiveWatch`, waits for it to fire on the
+      next genuine idle→active transition, and *only then* adds the next
+      `AddIdleWatch`, letting the compositor's own idle blank take effect in
+      the interim. The active-watch is armed after `Saver`'s `Drop` has
+      released the inhibitor, so the blinding caveat above does not apply.
+      See [Post-Phase-3 handoff](#post-phase-3-handoff-active-watch-gate)
+      for the race this avoids.
 - **Mid-run failures.** Once the watch loop is running, an error on the backend
   thread (the D-Bus connection dropping, or a `WatchFired` subscription / watch
   re-arm failing) ends the loop and logs `howan: Mutter idle watch loop ended:
@@ -272,10 +328,15 @@ stages](#dpms-suppression-stages) below.
 
 A concrete interaction surfaced here: holding the inhibitor makes Mutter treat
 the session as non-idle, which blinds its `IdleMonitor`. You therefore cannot
-both inhibit idle and detect the *next* idle through that one interface — so the
-backend re-arms idle detection from the dismiss event rather than from a Mutter
-user-active watch (see "Re-arm strategy"). DPMS suppression itself is unaffected:
-the inhibitor is held only while the saver is shown.
+both inhibit idle and detect the *next* idle through that one interface *while
+the inhibitor is held* — so the backend re-arms idle detection from the dismiss
+event for the input path rather than from a Mutter user-active watch (see
+"Re-arm strategy"). The post-Phase-3 path is the inverse: by the time the
+re-arm is requested the inhibitor has already been released by `Saver`'s
+`Drop`, so `AddUserActiveWatch` is then safe to use and is what gates the next
+idle watch — see [Post-Phase-3
+handoff](#post-phase-3-handoff-active-watch-gate). DPMS suppression itself is
+unaffected: the inhibitor is held only while the saver is shown.
 
 ## Verification
 
@@ -286,7 +347,9 @@ The deterministic checks below run in the canonical
 | --------------------------------------------------------------------- | ------ |
 | `howan daemon` subcommand parses; `--idle-timeout` overrides the 5-minute default | PASS (unit tests in `cli.rs`) |
 | Daemon loop consumes idle events through the `IdleSource` trait object  | PASS (fake backend test in `daemon.rs`) |
-| `IdleSource::rearm` before `start` is a benign no-op; `T1` → ms         | PASS (unit tests in `mutter.rs`) |
+| `IdleSource::rearm` / `rearm_after_active` before `start` are benign no-ops; `T1` → ms | PASS (unit tests in `mutter.rs`) |
+| `IdleSource::rearm_after_active` defaults to `rearm` for backends without a user-active signal | PASS (unit test in `daemon.rs`) |
+| `dismiss` flags `RearmIntent::Immediate`; `dpms_handoff` flags `RearmIntent::AfterActive` | PASS (unit test in `app.rs`) |
 | `grep -rn set_fullscreen crates/` returns comments only, no call site   | PASS |
 | No opaque region is declared on the (re)created surface                 | PASS (by inspection of `Saver::new`) |
 | Absent idle-inhibit manager ⇒ no inhibitor, no panic                    | PASS (unit test in `app.rs`) |
@@ -381,9 +444,12 @@ Two bugs surfaced and were fixed during this stage (both in the M3 change):
   treating the session as non-idle, so the saver showed only once. Fixed by
   destroying the inhibitor explicitly in `Saver`'s `Drop` (see "Suppressing DPMS
   while the saver is shown").
-- **Re-arm relied on a Mutter user-active watch**, which the held inhibitor
-  blinds. Re-arm is now driven from the dismiss event instead (see "Re-arm
-  strategy").
+- **Re-arm relied on a Mutter user-active watch armed while the inhibitor was
+  held**, which the inhibitor blinds. Re-arm for the input-dismiss path is now
+  driven from the dismiss event instead (see "Re-arm strategy"). A
+  user-active watch is still used, but only on the post-Phase-3 path where it
+  is armed *after* the inhibitor has been released — see [Post-Phase-3
+  handoff](#post-phase-3-handoff-active-watch-gate).
 
 ### DPMS Stage 2 (Blackwell sign-off)
 
@@ -437,18 +503,29 @@ dismissed. Record the result here.
 
 ### M4 Stage 3 (GNOME) — Phase 3 timer releases the inhibitor
 
-**Status: pending on-hardware verification.**
+**Status: pending on-hardware verification (post-Q4 fix).**
 
 Run `howan daemon --idle-timeout 5 --grace-timeout 30 --dpms-timeout 60` with
 a short GNOME `org.gnome.desktop.session idle-delay` (e.g. 30s) and leave the
 machine idle past 60s without input. At `T_dpms` the saver surface must
-disappear, the inhibitor must be gone, and within the compositor's own idle
-timer the display must physically blank (DPMS off). Confirm by observing the
-panel / wall clock. Record the result here.
+disappear, the inhibitor must be gone, the saver must **not** re-appear, and
+within the compositor's own idle-delay the display must physically blank
+(DPMS off). The first input wakes the display to the desktop (not to a
+re-shown saver); a subsequent idle period shows the saver again normally
+(Phase 1 of the next cycle). Confirm by observing the panel / wall clock and
+the saver behavior across at least two cycles. Record the result here.
+
+The initial M4 attempt observed the saver re-appearing immediately after
+`T_dpms` because the daemon re-armed its idle watch on the same path as an
+input dismiss — howan's `T1` (5s) won the race against the compositor's
+30s idle-delay, so the inhibitor was re-acquired before the blanker could
+fire. The Q4 follow-up (this task) gates the post-Phase-3 re-arm on a
+user-active transition; see [Post-Phase-3
+handoff](#post-phase-3-handoff-active-watch-gate).
 
 ### M4 Stage 4 (Blackwell sign-off, SSH-guarded) — DPMS off↔on
 
-**Status: pending on-hardware verification.**
+**Status: pending on-hardware verification (post-Q4 fix).**
 
 This is the new real-display power transition M4 introduces and the one M3
 deferred (per [DPMS Stage 2 above](#dpms-stage-2-blackwell-sign-off)). On the
@@ -459,7 +536,11 @@ second device, run the M4 Stage 3 scenario above and confirm:
 - The first input after DPMS off wakes the display normally.
 - `journalctl -k` / NVIDIA driver logs show no crash symptoms.
 
-Record the result here; this answers the sign-off the M3 task deferred to M4.
+This re-confirmation is repeated post-Q4 because the active-watch gate is
+what finally lets the DPMS off↔on transition actually happen — the M4-only
+implementation never reached DPMS off in practice (see Stage 3 above).
+Record the result here; this answers the sign-off the M3 task deferred to
+M4 (and that M4 in turn was unable to satisfy until Q4 landed).
 
 ### M4 Stage 5 — Lock-failure fallback (manual injection)
 
@@ -485,3 +566,15 @@ verify, because each emits a different diagnostic:
   line, because the in-process locker is the `NoopLocker` and never errors).
   This proves the degradation path documented in the Phase lifecycle section
   above — daemon-still-runs, Phase 2 collapses to Phase 1 behavior.
+
+### M4 Stage 6 (GNOME, post-Q4) — Long-running cycle through Phase 3
+
+**Status: pending on-hardware verification (post-Q4 fix).**
+
+With the same flags as M4 Stage 3 above, leave the daemon running through
+several full cycles (input wake → idle → saver → Phase 1 input dismiss → next
+idle → saver → Phase 2 lock+dismiss → next idle → saver → Phase 3 DPMS off
+→ input wake → ...) and confirm the daemon stays resident across cycles,
+subsequent cycles still trigger normally (i.e. the `rearm_after_active`
+path does not leak Mutter watches), and the daemon's stderr is empty
+across the cycles.
