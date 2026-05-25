@@ -61,13 +61,36 @@ pub trait IdleSource {
     /// hanging silently.
     fn start(&self, sender: Sender<IdleEvent>) -> Result<Box<dyn IdleHandle>, Box<dyn Error>>;
 
-    /// Re-arm the watch after the saver was dismissed by input, so the next
-    /// idle period produces another [`IdleEvent::Idle`].
+    /// Re-arm the watch immediately after the saver was dismissed by input, so
+    /// the next idle period produces another [`IdleEvent::Idle`].
     ///
-    /// Some backends re-fire automatically and only need this as a no-op; others
-    /// must re-add a watch. The contract is: after `rearm`, a subsequent idle
-    /// period reliably yields another event. See each backend for specifics.
+    /// This is the right primitive for the Phase 1 / Phase 2 input-dismiss
+    /// path: the user just produced input, so they are by definition active
+    /// and the next idle period begins from "now". Some backends re-fire
+    /// automatically and only need this as a no-op; others must re-add a
+    /// watch. The contract is: after `rearm`, a subsequent idle period
+    /// reliably yields another event. See each backend for specifics.
     fn rearm(&self) -> Result<(), Box<dyn Error>>;
+
+    /// Re-arm the watch only **after** the seat has been observed active
+    /// again, so the next idle period produces another [`IdleEvent::Idle`].
+    ///
+    /// This is the Phase 3 post-DPMS-handoff primitive: the daemon dropped
+    /// the saver (and its idle inhibitor) because `T_dpms` elapsed *without*
+    /// any input, so the user is still idle and arming a fresh idle watch
+    /// immediately would race the compositor's own idle blank — the howan
+    /// watch would fire first and re-show the saver before the compositor
+    /// ever reached DPMS off, leaving the display permanently un-blanked.
+    /// Waiting for a user-active transition gates the next idle watch on
+    /// genuine activity instead, letting the compositor's blanker run.
+    ///
+    /// The default implementation falls back to [`rearm`](IdleSource::rearm)
+    /// so a backend without a user-active signal degrades to the existing
+    /// "arm immediately" behavior. The Mutter backend overrides this with
+    /// the proper `AddUserActiveWatch`-then-`AddIdleWatch` semantics.
+    fn rearm_after_active(&self) -> Result<(), Box<dyn Error>> {
+        self.rearm()
+    }
 }
 
 #[cfg(test)]
@@ -80,10 +103,12 @@ mod tests {
     use super::*;
 
     /// A backend with no transport, used to prove the daemon loop depends only
-    /// on the `IdleSource` trait. It records how often `rearm` was called and
-    /// can push an idle event on demand through the channel it was started with.
+    /// on the `IdleSource` trait. It records how often `rearm` and
+    /// `rearm_after_active` were called separately and can push an idle event
+    /// on demand through the channel it was started with.
     struct FakeIdleSource {
         rearm_calls: Arc<AtomicU32>,
+        rearm_after_active_calls: Arc<AtomicU32>,
     }
 
     struct FakeHandle;
@@ -103,6 +128,13 @@ mod tests {
             self.rearm_calls.fetch_add(1, Ordering::SeqCst);
             Ok(())
         }
+
+        fn rearm_after_active(&self) -> Result<(), Box<dyn Error>> {
+            // Override the default fallback so the two intents are
+            // distinguishable in tests.
+            self.rearm_after_active_calls.fetch_add(1, Ordering::SeqCst);
+            Ok(())
+        }
     }
 
     #[test]
@@ -110,8 +142,10 @@ mod tests {
         // The daemon loop holds an `IdleSource` as a trait object, never the
         // concrete backend. Exercise that shape here.
         let rearm_calls = Arc::new(AtomicU32::new(0));
+        let rearm_after_active_calls = Arc::new(AtomicU32::new(0));
         let source: Box<dyn IdleSource> = Box::new(FakeIdleSource {
             rearm_calls: Arc::clone(&rearm_calls),
+            rearm_after_active_calls: Arc::clone(&rearm_after_active_calls),
         });
 
         let (tx, rx) = channel::<IdleEvent>();
@@ -125,6 +159,69 @@ mod tests {
         }
 
         source.rearm().expect("fake rearm never fails");
+        assert_eq!(rearm_calls.load(Ordering::SeqCst), 1);
+        assert_eq!(rearm_after_active_calls.load(Ordering::SeqCst), 0);
+    }
+
+    /// Input-dismiss path calls `rearm` (immediate); Phase 3 DPMS-handoff path
+    /// calls `rearm_after_active`. The two intents land on distinct trait
+    /// methods so backends can implement different semantics (immediate vs.
+    /// "wait for the seat to be active again first").
+    #[test]
+    fn dismiss_and_dpms_handoff_use_distinct_rearm_methods() {
+        let rearm_calls = Arc::new(AtomicU32::new(0));
+        let rearm_after_active_calls = Arc::new(AtomicU32::new(0));
+        let source: Box<dyn IdleSource> = Box::new(FakeIdleSource {
+            rearm_calls: Arc::clone(&rearm_calls),
+            rearm_after_active_calls: Arc::clone(&rearm_after_active_calls),
+        });
+
+        // `dismiss` from input → immediate re-arm.
+        source.rearm().expect("fake rearm never fails");
+        // `dpms_handoff` → re-arm gated on user-active.
+        source.rearm_after_active().expect("fake rearm never fails");
+
+        assert_eq!(
+            rearm_calls.load(Ordering::SeqCst),
+            1,
+            "input dismiss must call rearm exactly once"
+        );
+        assert_eq!(
+            rearm_after_active_calls.load(Ordering::SeqCst),
+            1,
+            "dpms_handoff must call rearm_after_active exactly once"
+        );
+    }
+
+    /// A backend that does not override `rearm_after_active` must transparently
+    /// fall back to `rearm`, so the daemon loop never has to special-case
+    /// backends without a user-active signal.
+    #[test]
+    fn rearm_after_active_default_falls_back_to_rearm() {
+        struct FallbackSource {
+            rearm_calls: Arc<AtomicU32>,
+        }
+        impl IdleSource for FallbackSource {
+            fn start(
+                &self,
+                _sender: Sender<IdleEvent>,
+            ) -> Result<Box<dyn IdleHandle>, Box<dyn Error>> {
+                Ok(Box::new(FakeHandle))
+            }
+            fn rearm(&self) -> Result<(), Box<dyn Error>> {
+                self.rearm_calls.fetch_add(1, Ordering::SeqCst);
+                Ok(())
+            }
+            // Intentionally does NOT override `rearm_after_active`.
+        }
+
+        let rearm_calls = Arc::new(AtomicU32::new(0));
+        let source: Box<dyn IdleSource> = Box::new(FallbackSource {
+            rearm_calls: Arc::clone(&rearm_calls),
+        });
+        source
+            .rearm_after_active()
+            .expect("fallback default never fails");
         assert_eq!(rearm_calls.load(Ordering::SeqCst), 1);
     }
 

@@ -241,11 +241,14 @@ pub fn run_daemon(
             }
         }
 
-        // Input dismiss sets `pending_rearm`; the surface is already gone. Tell
-        // the idle source to re-arm so the next idle period shows the saver
-        // again. The daemon itself stays resident.
-        if app.take_pending_rearm() {
-            idle_source.rearm()?;
+        // Either surface-drop path (input via `dismiss` or the Phase 3 timer
+        // via `dpms_handoff`) sets `pending_rearm`; the surface is already
+        // gone. Route the variant to the matching re-arm primitive — see
+        // [`RearmIntent`] for what each variant means.
+        match app.take_pending_rearm() {
+            Some(RearmIntent::Immediate) => idle_source.rearm()?,
+            Some(RearmIntent::AfterActive) => idle_source.rearm_after_active()?,
+            None => {}
         }
     }
 
@@ -345,11 +348,28 @@ pub(crate) struct HowanApp {
     /// Set by the `SIGTERM`/`SIGINT` handler to terminate the whole process.
     /// Input dismiss does **not** set this — it only drops `saver`.
     exit: bool,
-    /// Set when input has just dismissed the saver and the daemon loop should
-    /// re-arm its idle source. Cleared by [`take_pending_rearm`].
+    /// Set when the saver has just been dismissed and the daemon loop should
+    /// re-arm its idle source. The variant records *which* dismiss path ran
+    /// so `run_daemon` can pick between the two re-arm primitives on
+    /// [`IdleSource`](crate::daemon::IdleSource). Cleared by
+    /// [`take_pending_rearm`].
     ///
     /// [`take_pending_rearm`]: HowanApp::take_pending_rearm
-    pending_rearm: bool,
+    pending_rearm: Option<RearmIntent>,
+}
+
+/// Which re-arm primitive on [`IdleSource`](crate::daemon::IdleSource) the
+/// daemon loop should call after a dismiss. Decided at dismiss time so the
+/// loop does not have to re-derive the phase that ran.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum RearmIntent {
+    /// Phase 1 / Phase 2 input dismiss: the user produced input, arm a fresh
+    /// idle watch immediately.
+    Immediate,
+    /// Phase 3 DPMS handoff: dismiss happened without input, so the next
+    /// idle watch must be gated on a user-active transition (see Q4 in the
+    /// howan plan).
+    AfterActive,
 }
 
 /// The phase the saver is currently in, decided by how long it has been
@@ -460,7 +480,7 @@ impl HowanApp {
             t_dpms,
             locker,
             exit: false,
-            pending_rearm: false,
+            pending_rearm: None,
         })
     }
 
@@ -554,10 +574,12 @@ impl HowanApp {
         }
     }
 
-    /// Tear down the saver surface, regardless of the phase that triggered it.
+    /// Tear down the saver surface on the *immediate re-arm* path (input or a
+    /// compositor close request).
     ///
     /// This is the "drop surface + flag re-arm" primitive: it drops `saver`,
-    /// forgets the active output, and flags the daemon loop to re-arm. It does
+    /// forgets the active output, and flags the daemon loop to re-arm
+    /// *immediately* (the [`RearmIntent::Immediate`] variant). It does
     /// **not** set the process-exit flag — in the daemon, dismiss means "stay
     /// resident". The one-shot `run` loop notices `saver` is `None` and exits
     /// on its own. Idempotent: repeated calls after the first dismiss do
@@ -567,13 +589,16 @@ impl HowanApp {
     ///
     /// - Input goes through [`on_input`](HowanApp::on_input).
     /// - The Phase 3 calloop timer goes through
-    ///   [`dpms_handoff`](HowanApp::dpms_handoff).
+    ///   [`dpms_handoff`](HowanApp::dpms_handoff), which is the *separate*
+    ///   "drop surface + flag re-arm" primitive for the no-input path: it
+    ///   uses the [`RearmIntent::AfterActive`] variant instead — see that
+    ///   method.
     /// - A compositor-issued close request goes through `dismiss` directly
     ///   (no phase logic — the compositor's "please close" is unconditional).
     pub(crate) fn dismiss(&mut self) {
         if self.saver.take().is_some() {
             self.active_output = None;
-            self.pending_rearm = true;
+            self.pending_rearm = Some(RearmIntent::Immediate);
         }
     }
 
@@ -620,13 +645,25 @@ impl HowanApp {
     /// released (via [`Saver`]'s `Drop`) and the compositor's standard idle
     /// blank can take over.
     ///
-    /// Functionally equivalent to [`dismiss`](HowanApp::dismiss) today. The
-    /// distinct name documents the intent at the call site and leaves room
-    /// for the Phase 3 path to diverge later (e.g. a different re-arm policy
-    /// after a DPMS handoff) without rewiring the timer plumbing in
-    /// `run_daemon`.
+    /// Unlike [`dismiss`](HowanApp::dismiss), the saver is dropped without
+    /// any user input — the seat is still idle — so this flags
+    /// [`RearmIntent::AfterActive`] instead of `Immediate`. `run_daemon`
+    /// then calls
+    /// [`IdleSource::rearm_after_active`](crate::daemon::IdleSource::rearm_after_active),
+    /// which gates the next idle watch on a real user-active transition to
+    /// avoid racing the compositor's own idle blank. See
+    /// `docs/guides/40-resident-daemon.md` (Post-Phase-3 handoff) and Q4 in
+    /// the howan plan.
+    ///
+    /// Idempotent: if the saver is already gone (e.g. input dismiss won a
+    /// tight race against the calloop timer in the same dispatch tick) this
+    /// is a no-op — the pending re-arm intent already set by the winning
+    /// path is left alone.
     pub(crate) fn dpms_handoff(&mut self) {
-        self.dismiss();
+        if self.saver.take().is_some() {
+            self.active_output = None;
+            self.pending_rearm = Some(RearmIntent::AfterActive);
+        }
     }
 
     /// Ask logind to lock the current session via
@@ -650,11 +687,13 @@ impl HowanApp {
         self.exit
     }
 
-    /// Take and clear the "re-arm the idle source" flag set by [`dismiss`].
+    /// Take and clear the pending re-arm intent set by [`dismiss`] or
+    /// [`dpms_handoff`]. `None` means there is nothing to do this tick.
     ///
     /// [`dismiss`]: HowanApp::dismiss
-    fn take_pending_rearm(&mut self) -> bool {
-        std::mem::take(&mut self.pending_rearm)
+    /// [`dpms_handoff`]: HowanApp::dpms_handoff
+    fn take_pending_rearm(&mut self) -> Option<RearmIntent> {
+        self.pending_rearm.take()
     }
 
     /// Release seat input handles explicitly so the compositor does not see a
@@ -974,4 +1013,66 @@ mod tests {
         );
     }
 
+    /// `dismiss` (input path) and `dpms_handoff` (Phase 3 path) must land on
+    /// *different* re-arm intents — `Immediate` for input, `AfterActive` for
+    /// Phase 3 — so `run_daemon` can route them to the matching `IdleSource`
+    /// primitive (Q4: avoid the post-Phase-3 race against the compositor's
+    /// own idle blank).
+    ///
+    /// `HowanApp` itself cannot be constructed without a live Wayland
+    /// connection, but only the `saver` / `pending_rearm` fields participate
+    /// in the dismiss/handoff logic, so a small stub mirrors that shape
+    /// exactly.
+    #[test]
+    fn dismiss_and_dpms_handoff_set_distinct_rearm_intents() {
+        use super::RearmIntent;
+        struct StubApp {
+            saver: Option<()>,
+            pending_rearm: Option<RearmIntent>,
+        }
+        impl StubApp {
+            // Mirrors `HowanApp::dismiss`.
+            fn dismiss(&mut self) {
+                if self.saver.take().is_some() {
+                    self.pending_rearm = Some(RearmIntent::Immediate);
+                }
+            }
+            // Mirrors `HowanApp::dpms_handoff`.
+            fn dpms_handoff(&mut self) {
+                if self.saver.take().is_some() {
+                    self.pending_rearm = Some(RearmIntent::AfterActive);
+                }
+            }
+        }
+
+        // Input dismiss → immediate re-arm.
+        let mut app = StubApp {
+            saver: Some(()),
+            pending_rearm: None,
+        };
+        app.dismiss();
+        assert_eq!(app.pending_rearm, Some(RearmIntent::Immediate));
+        assert!(app.saver.is_none());
+
+        // Phase 3 dismiss → re-arm gated on the next user-active transition.
+        let mut app = StubApp {
+            saver: Some(()),
+            pending_rearm: None,
+        };
+        app.dpms_handoff();
+        assert_eq!(app.pending_rearm, Some(RearmIntent::AfterActive));
+        assert!(app.saver.is_none());
+
+        // Both are idempotent — calling again after the saver is already
+        // gone leaves the intent alone (avoids overwriting the right kind
+        // of re-arm if a stray event fires after dismiss).
+        let mut app = StubApp {
+            saver: None,
+            pending_rearm: Some(RearmIntent::AfterActive),
+        };
+        app.dismiss();
+        assert_eq!(app.pending_rearm, Some(RearmIntent::AfterActive));
+        app.dpms_handoff();
+        assert_eq!(app.pending_rearm, Some(RearmIntent::AfterActive));
+    }
 }
