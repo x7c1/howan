@@ -244,17 +244,21 @@ The Phase 1 / Phase 2 input path is unchanged — see
 
 howan hides the cursor on the saver surface via
 `wl_pointer.set_cursor(null)` on Enter and re-applies it at
-`dpms_handoff`. GNOME's last-few-seconds fade-to-black before DPMS off
-is rendered on a compositor path a regular Wayland client cannot
-suppress, so the cursor briefly reappears on the still-mapped saver.
-This is a side effect of the composited-surface workaround
-([30-composited-surface.md](30-composited-surface.md)); it should
-disappear when `set_fullscreen` is restored upstream of the Blackwell
-modeset fix.
+`dpms_handoff`. GNOME plays a short fade-to-black animation just before
+DPMS off engages; during that animation Mutter renders the system
+cursor on the hardware-cursor KMS plane, which bypasses the compositor's
+own fade path. Only the cursor remains bright while everything else
+dims, until the display is finally off.
 
-To skip the fade today:
-
-    gsettings set org.gnome.settings-daemon.plugins.power idle-dim false
+No client-side workaround is currently confirmed
+(`gsettings set org.gnome.settings-daemon.plugins.power idle-dim false`
+was tried and did not affect this — `idle-dim` controls a separate
+backlight-brightness step that howan's inhibitor already suppresses).
+This is an indirect consequence of howan's composited-surface workaround
+([30-composited-surface.md](30-composited-surface.md)); a fullscreen
+surface would put Mutter on its cursor-managed fullscreen path. The
+flicker is expected to disappear when `set_fullscreen` is restored
+upstream of the Blackwell modeset fix.
 
 ### PID file
 
