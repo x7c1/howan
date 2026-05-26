@@ -240,6 +240,22 @@ The Phase 1 / Phase 2 input path is unchanged — see
 `IdleSource::rearm`. On-hardware behavior is verified in
 [M4 Stage 3](#m4-stage-3-gnome--phase-3-timer-releases-the-inhibitor-surface-stays).
 
+### Known limitation: cursor visible during the fade to blank
+
+howan hides the cursor on the saver surface via
+`wl_pointer.set_cursor(null)` on Enter and re-applies it at
+`dpms_handoff`. GNOME's last-few-seconds fade-to-black before DPMS off
+is rendered on a compositor path a regular Wayland client cannot
+suppress, so the cursor briefly reappears on the still-mapped saver.
+This is a side effect of the composited-surface workaround
+([30-composited-surface.md](30-composited-surface.md)); it should
+disappear when `set_fullscreen` is restored upstream of the Blackwell
+modeset fix.
+
+To skip the fade today:
+
+    gsettings set org.gnome.settings-daemon.plugins.power idle-dim false
+
 ### PID file
 
 The daemon does **not** participate in the `howan start` / `howan stop` PID file
