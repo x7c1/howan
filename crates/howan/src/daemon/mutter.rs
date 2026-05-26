@@ -22,25 +22,39 @@
 //!
 //! `AddIdleWatch` is one-shot: it fires once and does not re-fire on subsequent
 //! idle periods. To produce an idle event on *every* idle period we re-add an
-//! idle watch after each cycle. The re-arm is driven by the daemon, not by
-//! Mutter's `AddUserActiveWatch`:
+//! idle watch after each cycle. The daemon drives the re-arm, and the *kind*
+//! of re-arm depends on which dismiss path ran:
 //!
 //! 1. Add an idle watch for `T1`; when it fires, emit [`IdleEvent::Idle`].
-//! 2. Block until the daemon calls [`IdleSource::rearm`] — which it does after
-//!    the saver is dismissed by input and its idle inhibitor has been released —
-//!    then add a fresh idle watch and repeat.
+//! 2. Block until the daemon sends a [`RearmKind`] through the rearm channel:
+//!    - [`RearmKind::Immediate`] — Phase 1 / Phase 2 input dismiss. The user
+//!      just produced input, so add a fresh `AddIdleWatch` right away.
+//!    - [`RearmKind::AfterActive`] — Phase 3 DPMS handoff. The user is still
+//!      idle (the timer fired *without* any input), so first add an
+//!      `AddUserActiveWatch`, wait for it to fire on the next genuine
+//!      idle→active transition, and only *then* add the next `AddIdleWatch`.
 //!
-//! We deliberately do **not** use `AddUserActiveWatch` to re-arm. While the
-//! saver is shown the daemon holds a `zwp_idle_inhibit_manager_v1` inhibitor
-//! (see the guide), which makes Mutter treat the session as non-idle and so
-//! blinds Mutter's own idle/active tracking: a user-active watch armed while the
-//! inhibitor is held does not fire on the real dismiss, which previously left
-//! the loop unable to re-arm — the saver showed once and never reappeared.
-//! Re-arming from the dismiss event is reliable instead: by the time the daemon
-//! calls `rearm` the saver surface and its inhibitor are gone, so a fresh idle
-//! watch counts idle normally. (You cannot both inhibit idle and detect idle
-//! through the same Mutter IdleMonitor at once; the daemon, which knows exactly
-//! when the saver was dismissed, is the right place to drive the re-arm.)
+//! ### Why an active-watch gate after Phase 3
+//!
+//! Without the gate, the daemon arms a fresh `AddIdleWatch` at `T_dpms` while
+//! the seat is still idle. Because howan's `T1` is shorter than the
+//! compositor's own `org.gnome.desktop.session idle-delay`, the new howan
+//! watch fires first, re-shows the saver, re-acquires the inhibitor, and the
+//! compositor never reaches DPMS off — the Phase 3 handoff is functionally
+//! a no-op. `AddUserActiveWatch` (Mutter `org.gnome.Mutter.IdleMonitor`)
+//! solves this cleanly: it fires once on the next idle→active transition, so
+//! the next idle watch is added only when the user is back, after the
+//! compositor's blank has had a chance to take effect.
+//!
+//! The input-dismiss path historically avoided `AddUserActiveWatch` because
+//! a held idle inhibitor blinds Mutter's idle/active tracking. That objection
+//! does not apply on the post-Phase-3 path: by the time `RearmKind::AfterActive`
+//! reaches the watch loop, Phase 3 has already destroyed the `Saver` and
+//! released the inhibitor, so the active watch sees unmasked state and fires
+//! on real user activity. The Phase 1 / Phase 2 input path still uses
+//! `RearmKind::Immediate` for a different reason: the user is active by
+//! definition there, and waiting for an active transition that has effectively
+//! already happened would deadlock the next idle cycle.
 
 use std::error::Error;
 use std::sync::atomic::{AtomicBool, Ordering};
@@ -64,6 +78,11 @@ trait IdleMonitor {
     /// Fire `WatchFired` once after the seat has been idle for `interval` ms.
     fn add_idle_watch(&self, interval: u64) -> zbus::Result<u32>;
 
+    /// Fire `WatchFired` once on the next idle → active transition. Used to
+    /// gate the next idle watch on real user activity after a Phase 3 DPMS
+    /// handoff (see the module docs).
+    fn add_user_active_watch(&self) -> zbus::Result<u32>;
+
     /// Remove a previously added watch.
     fn remove_watch(&self, id: u32) -> zbus::Result<()>;
 
@@ -75,14 +94,32 @@ trait IdleMonitor {
     fn watch_fired(&self, id: u32) -> zbus::Result<()>;
 }
 
+/// Which kind of re-arm the daemon is requesting after a dismiss.
+///
+/// Sent through the watch thread's rearm channel; the loop matches on it to
+/// pick between "add an idle watch right now" (input dismiss) and "add a
+/// user-active watch first, then an idle watch once it fires" (Phase 3 DPMS
+/// handoff). See the module-level "Re-arm strategy" docs for the full
+/// rationale.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum RearmKind {
+    /// The user just produced input — re-add the idle watch immediately.
+    Immediate,
+    /// The Phase 3 timer dismissed the saver while the user was still idle —
+    /// add a `AddUserActiveWatch` first, wait for it to fire, then add the
+    /// next idle watch.
+    AfterActive,
+}
+
 /// The GNOME Mutter idle source.
 pub struct MutterIdleSource {
     /// Idle threshold `T1` in milliseconds.
     interval_ms: u64,
     /// Sender to the watch thread, populated by [`start`](IdleSource::start).
-    /// [`rearm`](IdleSource::rearm) pushes a unit through it to ask the thread
-    /// to add a fresh idle watch for the next cycle.
-    rearm_tx: Mutex<Option<mpsc::Sender<()>>>,
+    /// [`rearm`](IdleSource::rearm) and
+    /// [`rearm_after_active`](IdleSource::rearm_after_active) push a
+    /// [`RearmKind`] through it to ask the thread for the next cycle.
+    rearm_tx: Mutex<Option<mpsc::Sender<RearmKind>>>,
 }
 
 impl MutterIdleSource {
@@ -92,6 +129,19 @@ impl MutterIdleSource {
             interval_ms: t1.as_millis() as u64,
             rearm_tx: Mutex::new(None),
         }
+    }
+
+    /// Common path for both [`rearm`](IdleSource::rearm) and
+    /// [`rearm_after_active`](IdleSource::rearm_after_active): forward a
+    /// [`RearmKind`] to the watch thread if one is running, otherwise no-op
+    /// (start has not been called yet — see `rearm_before_start_is_ok`).
+    fn send_rearm(&self, kind: RearmKind) -> Result<(), Box<dyn Error>> {
+        let guard = self.rearm_tx.lock().expect("rearm_tx mutex poisoned");
+        if let Some(tx) = guard.as_ref() {
+            tx.send(kind)
+                .map_err(|err| format!("failed to signal idle re-arm ({kind:?}): {err}"))?;
+        }
+        Ok(())
     }
 
     /// Connect to the session bus and confirm the Mutter IdleMonitor interface
@@ -132,7 +182,7 @@ impl IdleSource for MutterIdleSource {
 
         // The daemon signals re-arm (after a dismiss) through this channel; the
         // watch thread blocks on the receiver between idle cycles.
-        let (rearm_tx, rearm_rx) = mpsc::channel::<()>();
+        let (rearm_tx, rearm_rx) = mpsc::channel::<RearmKind>();
         *self.rearm_tx.lock().expect("rearm_tx mutex poisoned") = Some(rearm_tx);
 
         let handle = thread::Builder::new()
@@ -151,100 +201,144 @@ impl IdleSource for MutterIdleSource {
     }
 
     fn rearm(&self) -> Result<(), Box<dyn Error>> {
-        // Re-arm is driven from here (the dismiss path) rather than a Mutter
-        // user-active watch, because the idle inhibitor held while the saver is
-        // shown blinds Mutter's idle/active tracking (see the module docs).
-        // Signal the watch thread to add a fresh idle watch. If `start` has not
-        // run yet there is nothing to re-arm.
-        let guard = self.rearm_tx.lock().expect("rearm_tx mutex poisoned");
-        if let Some(tx) = guard.as_ref() {
-            tx.send(())
-                .map_err(|err| format!("failed to signal idle re-arm: {err}"))?;
-        }
-        Ok(())
+        // Input-dismiss path; see the module "Re-arm strategy" docs.
+        self.send_rearm(RearmKind::Immediate)
+    }
+
+    fn rearm_after_active(&self) -> Result<(), Box<dyn Error>> {
+        // Phase 3 DPMS-handoff path; see the module "Re-arm strategy" docs.
+        self.send_rearm(RearmKind::AfterActive)
     }
 }
 
 /// Drive the idle-watch / re-arm cycle until shutdown.
 ///
-/// Each cycle has two blocking phases that never overlap, so no cross-source
-/// `select` is needed: wait for an idle watch to fire (D-Bus signal), then wait
-/// for the daemon to re-arm after the dismiss (the `rearm_rx` channel).
+/// Each cycle has up to three blocking steps that never overlap, so no
+/// cross-source `select` is needed. These are loop-internal steps, not the
+/// saver's three `SaverPhase`s in `crate::app`; "step" is used here to avoid
+/// the name collision.
+///
+/// 1. Wait for the armed idle watch to fire (D-Bus signal).
+/// 2. Wait for the daemon to re-arm after dismiss (the `rearm_rx` channel).
+/// 3. *Only when re-arm is [`RearmKind::AfterActive`]*: arm a
+///    `AddUserActiveWatch`, wait for it to fire, then go back to step 1.
 fn run_watch_loop(
     interval_ms: u64,
     sender: &Sender<IdleEvent>,
     running: &AtomicBool,
-    rearm_rx: &mpsc::Receiver<()>,
+    rearm_rx: &mpsc::Receiver<RearmKind>,
 ) -> Result<(), Box<dyn Error>> {
     let connection =
         Connection::session().map_err(|err| format!("session bus connect failed: {err}"))?;
     let proxy = IdleMonitorProxyBlocking::new(&connection)
         .map_err(|err| format!("idle monitor proxy build failed: {err}"))?;
 
-    // Listen for all WatchFired signals; we match the fired id against the idle
+    // Listen for all WatchFired signals; we match the fired id against the
     // watch we currently expect.
     let mut signals = proxy
         .receive_watch_fired()
         .map_err(|err| format!("failed to subscribe to WatchFired: {err}"))?;
 
-    // The idle watch currently armed, tracked only for best-effort cleanup on
-    // exit (it is `None` while we are between cycles waiting on a re-arm).
-    let mut idle_watch: Option<u32> = None;
+    // The watch currently armed, tracked only for best-effort cleanup on exit
+    // (it is `None` while we are between cycles waiting on a re-arm). It can
+    // be either the idle watch (step 1 below) or the user-active watch (added
+    // at step 3 below for `RearmKind::AfterActive`), so a single slot is enough.
+    let mut pending_watch: Option<u32> = None;
 
     'cycles: loop {
         if !running.load(Ordering::Relaxed) {
             break;
         }
 
-        // Phase 1: arm an idle watch and wait for it to fire.
+        // Step 1: arm an idle watch and wait for it to fire.
         let armed = proxy
             .add_idle_watch(interval_ms)
             .map_err(|err| format!("AddIdleWatch failed: {err}"))?;
-        idle_watch = Some(armed);
+        pending_watch = Some(armed);
 
-        loop {
-            let Some(signal) = signals.next() else {
-                // The signal stream ended (bus closed): nothing more to wait on.
-                return Ok(());
-            };
-            if !running.load(Ordering::Relaxed) {
-                break 'cycles;
-            }
-            let args = match signal.args() {
-                Ok(args) => args,
-                Err(err) => {
-                    eprintln!("howan: malformed WatchFired signal: {err}");
-                    continue;
-                }
-            };
-            if args.id == armed {
-                break;
-            }
-            // A stale watch id (e.g. from a previous cycle): ignore.
+        if !wait_for_watch(&mut signals, running, armed)? {
+            break 'cycles;
         }
 
         // Idle threshold reached: tell the daemon to show the saver. The idle
         // watch is one-shot and now consumed.
-        idle_watch = None;
+        pending_watch = None;
         if sender.send(IdleEvent::Idle).is_err() {
             // The daemon has exited; stop the loop.
             break;
         }
 
-        // Phase 2: block until the daemon re-arms us. It calls `rearm` after the
-        // saver is dismissed by input and its idle inhibitor is released, so the
-        // fresh idle watch added at the top of the next cycle counts normally.
-        match rearm_rx.recv() {
-            Ok(()) => {}     // re-arm for the next idle period
+        // Step 2: block until the daemon re-arms us. It calls `rearm` after a
+        // saver-Phase 1 / Phase 2 input dismiss (immediate re-arm) or
+        // `rearm_after_active` after a saver-Phase 3 DPMS handoff (gated on
+        // the next user-active transition).
+        let kind = match rearm_rx.recv() {
+            Ok(kind) => kind,
             Err(_) => break, // the sender was dropped: daemon shutting down
+        };
+
+        // Step 3 (only for `AfterActive`): add an `AddUserActiveWatch` and
+        // wait for it to fire before looping back to the top to arm the next
+        // idle watch. By the time we reach this point the saver-Phase 3
+        // dismiss has already released the idle inhibitor (see `Saver`'s
+        // `Drop`), so Mutter's idle/active tracking is unmasked and the watch
+        // fires on real user activity.
+        if matches!(kind, RearmKind::AfterActive) {
+            let active = proxy
+                .add_user_active_watch()
+                .map_err(|err| format!("AddUserActiveWatch failed: {err}"))?;
+            pending_watch = Some(active);
+            if !wait_for_watch(&mut signals, running, active)? {
+                break 'cycles;
+            }
+            pending_watch = None;
         }
     }
 
-    // Best-effort cleanup of any outstanding idle watch.
-    if let Some(id) = idle_watch {
+    // Best-effort cleanup of any outstanding watch.
+    if let Some(id) = pending_watch {
         let _ = proxy.remove_watch(id);
     }
     Ok(())
+}
+
+/// Block on the `WatchFired` signal stream until the watch with id
+/// `expected` fires, or we are asked to stop, or the signal stream ends.
+///
+/// Returns `Ok(true)` on the expected fire and `Ok(false)` when shutdown was
+/// requested or the signal stream ended (both mean "break the outer cycle";
+/// stream-end is treated as benign shutdown, matching the previous in-line
+/// behavior). The `Err` arm is unreachable today — the return type leaves
+/// room for a future fallible check inside the loop without growing the
+/// call sites.
+fn wait_for_watch(
+    signals: &mut WatchFiredIterator,
+    running: &AtomicBool,
+    expected: u32,
+) -> Result<bool, Box<dyn Error>> {
+    loop {
+        let Some(signal) = signals.next() else {
+            // The signal stream ended (bus closed): nothing more to wait on.
+            // Propagate as "stop the outer loop" rather than as an error,
+            // matching the previous behavior.
+            return Ok(false);
+        };
+        if !running.load(Ordering::Relaxed) {
+            return Ok(false);
+        }
+        let args = match signal.args() {
+            Ok(args) => args,
+            Err(err) => {
+                eprintln!("howan: malformed WatchFired signal: {err}");
+                continue;
+            }
+        };
+        if args.id == expected {
+            return Ok(true);
+        }
+        // A stale watch id (e.g. from a previous cycle, or the other watch
+        // type in the same cycle): ignore.
+    }
 }
 
 /// Keeps the Mutter watch thread alive; dropping it stops the thread.
@@ -286,5 +380,17 @@ mod tests {
         // thread to add a fresh idle watch (see the module docs).
         let source = MutterIdleSource::new(Duration::from_secs(1));
         assert!(source.rearm().is_ok());
+    }
+
+    #[test]
+    fn rearm_after_active_before_start_is_ok() {
+        // The Phase 3 re-arm primitive shares the same "signal-or-noop" shape
+        // as `rearm`: before `start` has run the watch thread does not exist,
+        // so there is nothing to push the `RearmKind::AfterActive` message to
+        // and the call must succeed without error. Once `start` has run, the
+        // signal drives the user-active-watch gate in `run_watch_loop` (see
+        // the module docs).
+        let source = MutterIdleSource::new(Duration::from_secs(1));
+        assert!(source.rearm_after_active().is_ok());
     }
 }

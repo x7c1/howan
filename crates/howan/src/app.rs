@@ -12,13 +12,17 @@
 //! - [`run`] — the one-shot `howan start`: it shows the saver immediately and
 //!   exits the process on the first input (the manual/debug path).
 //! - [`run_daemon`] — the resident `howan daemon`: it stays connected with no
-//!   surface, shows the saver when the idle source fires, and on input drops
-//!   the *surface* (not the process), re-arming for the next idle cycle. See
-//!   `docs/guides/40-resident-daemon.md`.
+//!   surface, shows the saver when the idle source fires, dispatches input by
+//!   the elapsed-time three-phase lifecycle (see [`SaverPhase`] and
+//!   `docs/guides/40-resident-daemon.md`), and on dismiss drops the *surface*
+//!   (not the process), re-arming for the next idle cycle. The Phase 3 timer
+//!   releases the idle inhibitor (so the compositor can blank the display)
+//!   but leaves the surface up, so the desktop is never exposed behind the
+//!   saver during the compositor's blank-countdown window.
 //!
-//! In both cases input dismisses the saver; the difference is only what happens
-//! afterwards (process exit vs. stay resident), which is decided by the loop in
-//! the entry point, not by the surface code.
+//! In both cases dismiss tears down only the surface; the difference is only
+//! what happens afterwards (process exit vs. stay resident), which is decided
+//! by the loop in the entry point, not by the surface code.
 //!
 //! # Why no `set_fullscreen`
 //!
@@ -38,7 +42,7 @@
 //! can avoid pulling in libxkbcommon at build time. We only need to know that
 //! some key was pressed; full keymap interpretation is unnecessary.
 //!
-//! The module is split into three files so the boundaries that future
+//! The module is split into four files so the boundaries that future
 //! milestones will cross are explicit:
 //!
 //! - `app.rs` (this file) holds `run`, `run_daemon`, and the top-level
@@ -48,15 +52,21 @@
 //!   renderer; isolating it here means that change is local.
 //! - `app::handlers` contains every Wayland-protocol handler trait impl
 //!   plus the `delegate_*!` macros.
+//! - `app::lock` wraps the `systemd-logind` session-lock handoff used by
+//!   the Phase 2 input branch, with a `SessionLocker` trait so tests can
+//!   inject a stub without hitting D-Bus.
 
 mod handlers;
+mod lock;
 mod render;
 
 use std::error::Error;
-use std::time::Duration;
+use std::time::{Duration, Instant};
 
 use calloop::channel::{channel, Event as ChannelEvent};
 use calloop::signals::{Signal, Signals};
+use calloop::timer::{TimeoutAction, Timer};
+use calloop::RegistrationToken;
 use smithay_client_toolkit::{
     compositor::CompositorState,
     output::OutputState,
@@ -84,6 +94,7 @@ use wayland_protocols::wp::idle_inhibit::zv1::client::{
     zwp_idle_inhibitor_v1::ZwpIdleInhibitorV1,
 };
 
+use self::lock::{LogindLocker, NoopLocker, SessionLocker};
 use self::render::Renderer;
 use crate::daemon::{IdleEvent, IdleSource};
 use crate::pidfile::PidFileGuard;
@@ -119,7 +130,18 @@ pub fn run() -> Result<(), Box<dyn Error>> {
 
     insert_signal_source(&loop_handle)?;
 
-    let mut app = HowanApp::new(&globals, &qh)?;
+    // The one-shot `start` path exits on the first input, so it never reaches
+    // Phase 2 or Phase 3 in practice. Pass a `NoopLocker` directly instead of
+    // calling `build_locker()` — there is no point paying the D-Bus connect +
+    // `GetSession("auto")` round trip (or emitting the fallback warning on a
+    // non-systemd host) for a code path that cannot run.
+    let mut app = HowanApp::new(
+        &globals,
+        &qh,
+        Duration::from_secs(u64::MAX / 2),
+        Duration::from_secs(u64::MAX / 2),
+        Box::new(NoopLocker),
+    )?;
     // One-shot: show the saver immediately, then exit the process on dismiss.
     app.show_saver(&qh);
 
@@ -138,14 +160,25 @@ pub fn run() -> Result<(), Box<dyn Error>> {
 /// Run the resident daemon (`howan daemon`).
 ///
 /// Connects to Wayland but shows **no** surface until the idle source reports
-/// that the seat has been idle for `T1`. On the first input the saver surface
-/// is destroyed and the daemon re-arms the idle source, staying resident for
-/// the next cycle. `SIGTERM`/`SIGINT` terminate the whole daemon cleanly.
+/// that the seat has been idle for `T1`. Input tears down the saver surface,
+/// the Phase 3 timer releases the idle inhibitor (leaving the surface mapped
+/// so the desktop is not exposed when the compositor blanks the display), and
+/// either path drives the daemon to re-arm the idle source while staying
+/// resident for the next cycle. `SIGTERM`/`SIGINT` terminate the whole daemon
+/// cleanly.
 ///
 /// The loop consumes idle events through the [`IdleSource`] trait, so a future
 /// backend (e.g. `ext-idle-notify-v1` on wlroots) can be dropped in by writing
 /// a new `IdleSource` implementation without touching this function.
-pub fn run_daemon(idle_source: Box<dyn IdleSource>) -> Result<(), Box<dyn Error>> {
+///
+/// `t_grace` and `t_dpms` come from the daemon CLI flags and define the
+/// boundaries of the three-phase lifecycle — see [`SaverPhase`] and
+/// `docs/guides/40-resident-daemon.md`.
+pub fn run_daemon(
+    idle_source: Box<dyn IdleSource>,
+    t_grace: Duration,
+    t_dpms: Duration,
+) -> Result<(), Box<dyn Error>> {
     let conn = Connection::connect_to_env()?;
     let (globals, event_queue) = registry_queue_init(&conn)?;
     let qh = event_queue.handle();
@@ -176,21 +209,79 @@ pub fn run_daemon(idle_source: Box<dyn IdleSource>) -> Result<(), Box<dyn Error>
     // error and a non-zero exit instead of a silent hang.
     let _idle_handle = idle_source.start(idle_tx)?;
 
-    let mut app = HowanApp::new(&globals, &qh)?;
+    let mut app = HowanApp::new(&globals, &qh, t_grace, t_dpms, build_locker())?;
+
+    // The Phase 3 timer source. We register/cancel a calloop Timer for
+    // `t_dpms` whenever the saver is shown / dismissed.
+    let mut dpms_timer_token: Option<RegistrationToken> = None;
 
     while !app.should_quit() {
         event_loop.dispatch(DISPATCH_TIMEOUT, &mut app)?;
 
-        // Input dismiss sets `pending_rearm`; the surface is already gone. Tell
-        // the idle source to re-arm so the next idle period shows the saver
-        // again. The daemon itself stays resident.
-        if app.take_pending_rearm() {
-            idle_source.rearm()?;
+        // If a saver was just shown and no timer is armed yet, arm one for
+        // `t_dpms`. This must run after `dispatch` so the show triggered by
+        // `on_idle` is observable here.
+        if app.saver.is_some() && dpms_timer_token.is_none() {
+            let token = loop_handle
+                .insert_source(
+                    Timer::from_duration(t_dpms),
+                    |_deadline, _meta, app: &mut HowanApp| {
+                        app.dpms_handoff();
+                        TimeoutAction::Drop
+                    },
+                )
+                .map_err(|err| {
+                    format!("failed to insert dpms timer into event loop: {err}")
+                })?;
+            dpms_timer_token = Some(token);
+        }
+
+        // If the saver is gone but our timer is still registered, cancel it.
+        // The Phase 3 timer-fire path itself does **not** drop the saver
+        // anymore (the surface is kept up to hide the desktop during the
+        // compositor's blank window), so `saver.is_none()` here means an
+        // input dismiss has just happened. If the Phase 3 timer already
+        // fired, the calloop closure (line 230) returned
+        // `TimeoutAction::Drop` and the source has already been removed —
+        // so `loop_handle.remove(token)` below finds a stale handle. That
+        // is harmless: calloop silently ignores unknown tokens.
+        if app.saver.is_none() {
+            if let Some(token) = dpms_timer_token.take() {
+                loop_handle.remove(token);
+            }
+        }
+
+        // Both re-arm paths set `pending_rearm`: input dismiss via
+        // `dismiss` (Immediate) and the Phase 3 timer via `dpms_handoff`
+        // (AfterActive, with the surface intentionally still up). Route
+        // the variant to the matching re-arm primitive — see
+        // [`RearmIntent`] for what each variant means.
+        match app.take_pending_rearm() {
+            Some(RearmIntent::Immediate) => idle_source.rearm()?,
+            Some(RearmIntent::AfterActive) => idle_source.rearm_after_active()?,
+            None => {}
         }
     }
 
     app.release_input_handles();
     Ok(())
+}
+
+/// Construct the production [`SessionLocker`]. A failure (e.g. logind is not
+/// reachable on a non-systemd session) falls back to a no-op locker so the
+/// daemon still runs — Phase 2 then behaves like Phase 1, which is strictly
+/// safer than refusing to start.
+fn build_locker() -> Box<dyn SessionLocker> {
+    match LogindLocker::new() {
+        Ok(locker) => Box::new(locker),
+        Err(err) => {
+            eprintln!(
+                "howan: systemd-logind session lock unavailable ({err}); \
+                 Phase 2 input will dismiss the saver without locking"
+            );
+            Box::new(NoopLocker)
+        }
+    }
 }
 
 /// Register the `SIGTERM`/`SIGINT` handler on the event loop.
@@ -246,18 +337,89 @@ pub(crate) struct HowanApp {
     pub(crate) keyboard: Option<WlKeyboard>,
     pub(crate) pointer: Option<WlPointer>,
     pub(crate) touch: Option<WlTouch>,
+    /// The serial of the most recent `wl_pointer.enter` event delivered to the
+    /// saver surface, cached so [`dpms_handoff`] can re-issue
+    /// `wl_pointer.set_cursor` with a null cursor. The initial Enter (handled in
+    /// `app/handlers.rs`) hides the cursor for the saver's lifetime, but Mutter
+    /// re-evaluates seat state when the idle inhibitor is destroyed and renders
+    /// its default cursor on top of the still-mapped saver in the Phase 3
+    /// → DPMS-off window. Re-applying the null cursor with the cached serial at
+    /// `dpms_handoff` keeps the saver visually clean through that window. `None`
+    /// until the first Enter on the saver, in which case no re-apply is possible
+    /// (and the cursor was already not hidden, matching pre-task behavior).
+    ///
+    /// [`dpms_handoff`]: HowanApp::dpms_handoff
+    pub(crate) last_pointer_enter_serial: Option<u32>,
     /// The output the saver surface is shown on. We track the output the
     /// surface entered ("active output only"); until a surface-enter event
     /// arrives we fall back to the first advertised output.
     pub(crate) active_output: Option<WlOutput>,
+    /// Phase 1 → Phase 2 boundary (`T_grace` in the design): until this much
+    /// time has passed since the saver was shown, input dismisses the saver
+    /// outright. From here on, input first locks the session and then
+    /// dismisses. Threaded in from the CLI at `new` time so the timer plumbing
+    /// and the input dispatch read the same value.
+    t_grace: Duration,
+    /// Phase 2 → Phase 3 boundary (`T_dpms` in the design): the daemon arms a
+    /// calloop timer for this duration when the saver is shown and on fire
+    /// releases the idle inhibitor (via [`HowanApp::dpms_handoff`]) so the
+    /// compositor's own idle blank can take over. The saver surface itself is
+    /// **kept mapped** through the compositor's blank window so the desktop is
+    /// not exposed behind it — see [`SaverPhase::Phase3`].
+    t_dpms: Duration,
+    /// Session locker used by the Phase 2 input branch. A `Box<dyn ...>` so a
+    /// test stub can be injected — the production implementation is
+    /// [`lock::LogindLocker`].
+    locker: Box<dyn SessionLocker>,
     /// Set by the `SIGTERM`/`SIGINT` handler to terminate the whole process.
     /// Input dismiss does **not** set this — it only drops `saver`.
     exit: bool,
-    /// Set when input has just dismissed the saver and the daemon loop should
-    /// re-arm its idle source. Cleared by [`take_pending_rearm`].
+    /// Set when the daemon loop should re-arm its idle source after a Phase
+    /// 1/2/3 event. The variant records *which* path ran so `run_daemon` can
+    /// pick between the two re-arm primitives on
+    /// [`IdleSource`](crate::daemon::IdleSource): [`dismiss`] sets
+    /// `Immediate` (input tore down the surface), and [`dpms_handoff`] sets
+    /// `AfterActive` (the Phase 3 timer destroyed the inhibitor while
+    /// keeping the surface mapped). Cleared by [`take_pending_rearm`].
     ///
+    /// [`dismiss`]: HowanApp::dismiss
+    /// [`dpms_handoff`]: HowanApp::dpms_handoff
     /// [`take_pending_rearm`]: HowanApp::take_pending_rearm
-    pending_rearm: bool,
+    pending_rearm: Option<RearmIntent>,
+}
+
+/// Which re-arm primitive on [`IdleSource`](crate::daemon::IdleSource) the
+/// daemon loop should call after a dismiss. Decided at dismiss time so the
+/// loop does not have to re-derive the phase that ran.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum RearmIntent {
+    /// Phase 1 / Phase 2 input dismiss: the user produced input, arm a fresh
+    /// idle watch immediately.
+    Immediate,
+    /// Phase 3 DPMS handoff: the handoff destroyed the idle inhibitor
+    /// without any input (the saver surface stays mapped — see
+    /// [`HowanApp::dpms_handoff`]), so the next idle watch must be gated on
+    /// a user-active transition (see Q4 in the howan plan).
+    AfterActive,
+}
+
+/// The phase the saver is currently in, decided by how long it has been
+/// shown. See [`Saver::phase`] and `docs/guides/40-resident-daemon.md`.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum SaverPhase {
+    /// Up to `T_grace` after the saver was shown: input dismisses the saver
+    /// outright.
+    Phase1,
+    /// Between `T_grace` (inclusive) and `T_dpms` (exclusive): input invokes
+    /// `org.freedesktop.login1.Session.Lock`, then dismisses the saver.
+    Phase2,
+    /// `T_dpms` (inclusive) and onward: the daemon's calloop timer has
+    /// released the idle inhibitor (so the compositor's standard idle blank
+    /// takes over) while leaving the saver surface mapped — the desktop
+    /// stays hidden behind the saver through the compositor's blank window.
+    /// Input that wakes the display now lands on the saver, and this branch
+    /// is the normal path: it dismisses the surface like Phase 1 does.
+    Phase3,
 }
 
 /// The recreatable on-screen saver: an output-sized composited toplevel and the
@@ -273,25 +435,44 @@ pub(crate) struct Saver {
     /// `weston`) reject the premature commit; Mutter tolerates it.
     pub(crate) configured: bool,
     /// The idle inhibitor held against this saver's `wl_surface` for as long as
-    /// the saver is shown, so the compositor does not blank the display (DPMS
-    /// off) behind it. `None` when the idle-inhibit manager global was absent at
-    /// startup.
+    /// the saver should suppress the compositor's idle blank, so the
+    /// compositor does not blank the display (DPMS off) behind it. `None` in
+    /// either of two cases: the idle-inhibit manager global was absent at
+    /// startup, or the inhibitor has already been destroyed by
+    /// [`HowanApp::dpms_handoff`] (at `T_dpms`) before the surface itself was
+    /// dropped.
     ///
-    /// Released in [`Saver`]'s `Drop` impl, which explicitly sends
-    /// `zwp_idle_inhibitor_v1.destroy`. This **must** be explicit:
-    /// `wayland-client` proxies do not send their destructor request when the
-    /// Rust handle is dropped, so without it the inhibitor leaks and Mutter keeps
-    /// treating the session as non-idle even after dismiss — blocking both the
-    /// DPMS resume and the next idle detection (the saver would show only once).
+    /// Released either by [`HowanApp::dpms_handoff`] (Phase 3 handoff, surface
+    /// stays mapped) or by [`Saver`]'s `Drop` (input dismiss, surface goes
+    /// away). Both sites explicitly send `zwp_idle_inhibitor_v1.destroy`.
+    /// This **must** be explicit: `wayland-client` proxies do not send their
+    /// destructor request when the Rust handle is dropped, so without it the
+    /// inhibitor leaks and Mutter keeps treating the session as non-idle even
+    /// after dismiss — blocking both the DPMS resume and the next idle
+    /// detection (the saver would show only once).
     inhibitor: Option<ZwpIdleInhibitorV1>,
+    /// The instant this saver was constructed — i.e. when the saver first
+    /// became visible for the current cycle. It is the single source of truth
+    /// for the three-phase lifecycle: [`Saver::phase`] compares `now -
+    /// shown_at` against `T_grace` / `T_dpms` to decide which branch input or
+    /// the timer should take.
+    shown_at: Instant,
 }
 
 impl HowanApp {
     /// Bind the durable Wayland globals. No surface is created here; call
     /// [`show_saver`](HowanApp::show_saver) to put the saver on screen.
+    ///
+    /// `t_grace` and `t_dpms` define the three-phase lifecycle thresholds —
+    /// see [`SaverPhase`] and `docs/guides/40-resident-daemon.md`. `locker`
+    /// is the handle used for the Phase 2 lock-session handoff; production
+    /// callers pass [`lock::LogindLocker`], tests inject a stub.
     fn new(
         globals: &wayland_client::globals::GlobalList,
         qh: &QueueHandle<HowanApp>,
+        t_grace: Duration,
+        t_dpms: Duration,
+        locker: Box<dyn SessionLocker>,
     ) -> Result<Self, Box<dyn Error>> {
         let compositor = CompositorState::bind(globals, qh)
             .map_err(|err| format!("wl_compositor not available: {err}"))?;
@@ -332,8 +513,12 @@ impl HowanApp {
             pointer: None,
             touch: None,
             active_output: None,
+            t_grace,
+            t_dpms,
+            locker,
             exit: false,
-            pending_rearm: false,
+            pending_rearm: None,
+            last_pointer_enter_serial: None,
         })
     }
 
@@ -427,18 +612,131 @@ impl HowanApp {
         }
     }
 
-    /// Dismiss the saver in response to user input.
+    /// Tear down the saver surface on the *immediate re-arm* path (input or a
+    /// compositor close request).
     ///
-    /// This tears down only the *surface* — it drops `saver` and forgets the
-    /// active output, and flags the daemon loop to re-arm. It does **not** set
-    /// the process-exit flag: in the daemon, input means "stay resident". The
-    /// one-shot `run` loop notices `saver` is `None` and exits on its own.
+    /// This is the "drop surface + flag re-arm" primitive: it drops `saver`,
+    /// forgets the active output, and flags the daemon loop to re-arm
+    /// *immediately* (the [`RearmIntent::Immediate`] variant). It does
+    /// **not** set the process-exit flag — in the daemon, dismiss means "stay
+    /// resident". The one-shot `run` loop notices `saver` is `None` and exits
+    /// on its own. Idempotent: repeated calls after the first dismiss do
+    /// nothing.
     ///
-    /// Idempotent: repeated input events after the first dismiss do nothing.
+    /// Higher-level entry points dispatch to this primitive by phase:
+    ///
+    /// - Input goes through [`on_input`](HowanApp::on_input). The Phase 3 arm
+    ///   reaches `dismiss` after a prior [`dpms_handoff`](HowanApp::dpms_handoff)
+    ///   has already destroyed the inhibitor and left the surface mapped; the
+    ///   `Immediate` set here overrides the `AfterActive` the handoff set.
+    /// - The Phase 3 calloop timer goes through
+    ///   [`dpms_handoff`](HowanApp::dpms_handoff), the *separate* "release
+    ///   inhibitor + flag re-arm" primitive for the no-input path: it keeps
+    ///   the `Saver` surface mapped (so the desktop is not exposed during the
+    ///   compositor's blank window) and uses the [`RearmIntent::AfterActive`]
+    ///   variant — see that method.
+    /// - A compositor-issued close request goes through `dismiss` directly
+    ///   (no phase logic — the compositor's "please close" is unconditional).
     pub(crate) fn dismiss(&mut self) {
         if self.saver.take().is_some() {
             self.active_output = None;
-            self.pending_rearm = true;
+            self.pending_rearm = Some(RearmIntent::Immediate);
+        }
+    }
+
+    /// Dispatch on user input according to the current saver phase.
+    ///
+    /// - Phase 1: drop the surface (the M3 behavior).
+    /// - Phase 2: ask logind to lock the session, then drop the surface. The
+    ///   lock call is "fire-and-forget"; if it fails we log a single stderr
+    ///   line and **still** drop the surface so the user is never left
+    ///   staring at a saver they cannot get out of (the "log + proceed"
+    ///   contract from the plan).
+    /// - Phase 3: the **normal** path for input after the Phase 3 DPMS
+    ///   handoff. The handoff released the inhibitor but left the surface
+    ///   mapped, so the compositor blanked the display behind the saver
+    ///   (not the desktop). Input wakes the display to the saver, and this
+    ///   branch dismisses it like Phase 1 does, overriding the pending
+    ///   `AfterActive` intent with `Immediate`. In the corner case where
+    ///   input lands at the exact `T_dpms` boundary before the calloop
+    ///   timer has dispatched, the inhibitor is still held — `Saver`'s
+    ///   `Drop` (run by `dismiss`) then destroys it, matching the
+    ///   pre-`T_dpms` cleanup.
+    ///
+    /// Called by every keyboard / pointer / touch handler. The compositor's
+    /// own "please close" path keeps calling [`dismiss`](HowanApp::dismiss)
+    /// directly — only user input goes through `on_input`.
+    pub(crate) fn on_input(&mut self) {
+        let Some(saver) = self.saver.as_ref() else {
+            // No saver is shown — nothing to dispatch on. Input arriving with
+            // no saver can happen via raced events around a just-dismissed
+            // surface; matching `dismiss`'s idempotence, this is a no-op.
+            return;
+        };
+        match saver.phase(Instant::now(), self.t_grace, self.t_dpms) {
+            SaverPhase::Phase1 => self.dismiss(),
+            SaverPhase::Phase2 => {
+                self.lock_session();
+                self.dismiss();
+            }
+            SaverPhase::Phase3 => self.dismiss(),
+        }
+    }
+
+    /// Phase 3 timer callback: release the inhibitor while keeping the saver
+    /// surface mapped, so the compositor's standard idle blank can take over
+    /// without exposing the desktop behind the saver. The next input then
+    /// routes through [`on_input`](HowanApp::on_input)'s Phase 3 branch, which
+    /// calls [`dismiss`](HowanApp::dismiss) to tear the surface down.
+    ///
+    /// Unlike [`dismiss`](HowanApp::dismiss), this runs without any user
+    /// input — the seat is still idle — so it flags
+    /// [`RearmIntent::AfterActive`] instead of `Immediate`. `run_daemon`
+    /// then calls
+    /// [`IdleSource::rearm_after_active`](crate::daemon::IdleSource::rearm_after_active),
+    /// which gates the next idle watch on a real user-active transition to
+    /// avoid racing the compositor's own idle blank. See
+    /// `docs/guides/40-resident-daemon.md` (Post-Phase-3 handoff) and Q4 in
+    /// the howan plan.
+    ///
+    /// The inhibitor is destroyed via the same `zwp_idle_inhibitor_v1.destroy`
+    /// call [`Saver`]'s `Drop` performs; the `Saver::inhibitor` field is left
+    /// `None`, so the eventual `Saver::Drop` becomes a no-op for the inhibitor.
+    ///
+    /// Idempotent: if the saver is already gone (e.g. input dismiss won a
+    /// tight race against the calloop timer in the same dispatch tick) this
+    /// is a no-op — the pending re-arm intent already set by the winning
+    /// path is left alone.
+    pub(crate) fn dpms_handoff(&mut self) {
+        if let Some(saver) = self.saver.as_mut() {
+            if let Some(inhibitor) = saver.inhibitor.take() {
+                inhibitor.destroy();
+            }
+            // Re-apply the null cursor for the saver surface. The initial Enter
+            // hides the cursor (see `app/handlers.rs`), but Mutter re-evaluates
+            // seat state when the idle inhibitor is destroyed and renders its
+            // default cursor on top of the still-mapped saver until DPMS off.
+            // Re-issuing `set_cursor` with the cached Enter serial keeps the
+            // saver visually clean through the compositor's blank window. When
+            // the pointer has not yet entered the saver (`last_pointer_enter_serial
+            // == None`) there is nothing to re-apply.
+            if let (Some(pointer), Some(serial)) =
+                (self.pointer.as_ref(), self.last_pointer_enter_serial)
+            {
+                pointer.set_cursor(serial, None, 0, 0);
+            }
+            self.pending_rearm = Some(RearmIntent::AfterActive);
+        }
+    }
+
+    /// Ask logind to lock the current session via
+    /// `org.freedesktop.login1.Session.Lock`. Logs a single stderr line on
+    /// failure and returns — the caller (`on_input`) proceeds to dismiss
+    /// regardless. Tested via the injected
+    /// [`SessionLocker`](lock::SessionLocker) (see `FailingLocker`).
+    fn lock_session(&self) {
+        if let Err(err) = self.locker.lock() {
+            eprintln!("howan: lock-session failed: {err}");
         }
     }
 
@@ -452,11 +750,13 @@ impl HowanApp {
         self.exit
     }
 
-    /// Take and clear the "re-arm the idle source" flag set by [`dismiss`].
+    /// Take and clear the pending re-arm intent set by [`dismiss`] or
+    /// [`dpms_handoff`]. `None` means there is nothing to do this tick.
     ///
     /// [`dismiss`]: HowanApp::dismiss
-    fn take_pending_rearm(&mut self) -> bool {
-        std::mem::take(&mut self.pending_rearm)
+    /// [`dpms_handoff`]: HowanApp::dpms_handoff
+    fn take_pending_rearm(&mut self) -> Option<RearmIntent> {
+        self.pending_rearm.take()
     }
 
     /// Release seat input handles explicitly so the compositor does not see a
@@ -538,12 +838,38 @@ impl Saver {
             renderer,
             configured: false,
             inhibitor,
+            shown_at: Instant::now(),
         })
+    }
+
+    /// Decide which phase the saver is currently in.
+    ///
+    /// The decision is pure: it compares `now - shown_at` against `t_grace`
+    /// and `t_dpms`. The boundaries are inclusive on the lower side — exactly
+    /// at `t_grace` we are already in Phase 2, and exactly at `t_dpms` we are
+    /// already in Phase 3. This matches the timer semantics in `run_daemon`,
+    /// which arms `Timer::from_duration(t_dpms)`: when the timer fires, the
+    /// elapsed time is `t_dpms` and we must be in Phase 3.
+    pub(crate) fn phase(
+        &self,
+        now: Instant,
+        t_grace: Duration,
+        t_dpms: Duration,
+    ) -> SaverPhase {
+        let elapsed = now.saturating_duration_since(self.shown_at);
+        if elapsed >= t_dpms {
+            SaverPhase::Phase3
+        } else if elapsed >= t_grace {
+            SaverPhase::Phase2
+        } else {
+            SaverPhase::Phase1
+        }
     }
 }
 
 impl Drop for Saver {
-    /// Explicitly destroy the idle inhibitor before the surface is torn down.
+    /// Explicitly destroy the idle inhibitor before the surface is torn down,
+    /// unless [`HowanApp::dpms_handoff`] has already taken and destroyed it.
     ///
     /// `wayland-client` does **not** send a proxy's destructor request when the
     /// Rust handle is dropped, so the inhibitor must be destroyed by hand.
@@ -552,6 +878,11 @@ impl Drop for Saver {
     /// `destroy` here, before the `window` field drops and tears down the
     /// surface, releases the inhibitor in the protocol-correct order; the
     /// request is flushed on the daemon's next event-loop dispatch.
+    ///
+    /// After a Phase 3 handoff the `inhibitor` field is already `None`
+    /// (`HowanApp::dpms_handoff` took it via `Option::take` and called
+    /// `destroy` itself), so this becomes a no-op — exactly the same code
+    /// path the absent-manager case takes.
     fn drop(&mut self) {
         if let Some(inhibitor) = self.inhibitor.take() {
             inhibitor.destroy();
@@ -576,7 +907,12 @@ where
 
 #[cfg(test)]
 mod tests {
-    use super::make_inhibitor;
+    use std::sync::atomic::Ordering;
+    use std::time::{Duration, Instant};
+
+    use super::lock::testing::FailingLocker;
+    use super::lock::SessionLocker;
+    use super::{make_inhibitor, SaverPhase};
 
     /// When the idle-inhibit manager is absent, no inhibitor is created and the
     /// `create` closure is never called — the daemon must still show the saver,
@@ -602,5 +938,336 @@ mod tests {
         });
         assert_eq!(inhibitor, Some(42));
         assert_eq!(calls, 1);
+    }
+
+    /// A copy of [`super::Saver::phase`]'s decision rule that does not
+    /// require constructing a real `Saver` (which needs a live Wayland
+    /// connection). The unit tests target this function so they can drive
+    /// arbitrary `(shown_at, now)` pairs.
+    fn phase_of(
+        shown_at: Instant,
+        now: Instant,
+        t_grace: Duration,
+        t_dpms: Duration,
+    ) -> SaverPhase {
+        let elapsed = now.saturating_duration_since(shown_at);
+        if elapsed >= t_dpms {
+            SaverPhase::Phase3
+        } else if elapsed >= t_grace {
+            SaverPhase::Phase2
+        } else {
+            SaverPhase::Phase1
+        }
+    }
+
+    #[test]
+    fn phase_well_below_t_grace_is_phase1() {
+        let shown_at = Instant::now();
+        let now = shown_at + Duration::from_secs(5);
+        let t_grace = Duration::from_secs(30);
+        let t_dpms = Duration::from_secs(60);
+        assert_eq!(phase_of(shown_at, now, t_grace, t_dpms), SaverPhase::Phase1);
+    }
+
+    #[test]
+    fn phase_at_exact_t_grace_is_phase2() {
+        // Boundary at exactly T_grace is Phase 2.
+        let shown_at = Instant::now();
+        let t_grace = Duration::from_secs(30);
+        let t_dpms = Duration::from_secs(60);
+        let now = shown_at + t_grace;
+        assert_eq!(phase_of(shown_at, now, t_grace, t_dpms), SaverPhase::Phase2);
+    }
+
+    #[test]
+    fn phase_between_t_grace_and_t_dpms_is_phase2() {
+        let shown_at = Instant::now();
+        let t_grace = Duration::from_secs(30);
+        let t_dpms = Duration::from_secs(60);
+        let now = shown_at + Duration::from_secs(45);
+        assert_eq!(phase_of(shown_at, now, t_grace, t_dpms), SaverPhase::Phase2);
+    }
+
+    #[test]
+    fn phase_at_exact_t_dpms_is_phase3() {
+        // Boundary at exactly T_dpms is Phase 3. This matches the calloop
+        // timer semantics in `run_daemon`: when `Timer::from_duration(t_dpms)`
+        // fires, `now - shown_at == t_dpms` and the callback must take the
+        // Phase 3 branch.
+        let shown_at = Instant::now();
+        let t_grace = Duration::from_secs(30);
+        let t_dpms = Duration::from_secs(60);
+        let now = shown_at + t_dpms;
+        assert_eq!(phase_of(shown_at, now, t_grace, t_dpms), SaverPhase::Phase3);
+    }
+
+    #[test]
+    fn phase_past_t_dpms_is_phase3() {
+        let shown_at = Instant::now();
+        let t_grace = Duration::from_secs(30);
+        let t_dpms = Duration::from_secs(60);
+        let now = shown_at + Duration::from_secs(120);
+        assert_eq!(phase_of(shown_at, now, t_grace, t_dpms), SaverPhase::Phase3);
+    }
+
+    /// `on_input` must be a no-op when `self.saver` is `None`. We can exercise
+    /// this branch by reproducing the guard locally — `HowanApp` itself
+    /// cannot be constructed without a live Wayland connection, but the only
+    /// state `on_input` reads in the absent-saver branch is `self.saver`
+    /// itself, so the contract is observable here.
+    #[test]
+    fn on_input_is_noop_when_no_saver() {
+        // Stand-in for `HowanApp` shape relevant to the branch.
+        struct StubApp {
+            saver: Option<()>,
+            dispatched: u32,
+        }
+        impl StubApp {
+            fn on_input(&mut self) {
+                if self.saver.is_none() {
+                    return;
+                }
+                self.dispatched += 1;
+            }
+        }
+        let mut app = StubApp {
+            saver: None,
+            dispatched: 0,
+        };
+        app.on_input();
+        assert_eq!(
+            app.dispatched, 0,
+            "on_input with no saver must not dispatch any phase branch"
+        );
+    }
+
+    /// Stub mirroring just the Phase 2 branch of `HowanApp::on_input`,
+    /// without the Wayland dependencies, so the "lock failure → dismiss
+    /// still runs" contract is testable in CI. `phase2_input` always takes
+    /// the Phase 2 branch regardless of timing.
+    struct StubAppPhase2 {
+        locker: Box<dyn SessionLocker>,
+        dismissed: bool,
+    }
+    impl StubAppPhase2 {
+        fn phase2_input(&mut self) {
+            // This mirrors `HowanApp::on_input`'s Phase 2 arm verbatim:
+            // call the locker, log on error, then dismiss unconditionally.
+            if let Err(err) = self.locker.lock() {
+                eprintln!("howan: lock-session failed: {err}");
+            }
+            self.dismissed = true;
+        }
+    }
+
+    /// The Phase 2 contract: even when the locker errors, the saver is still
+    /// dismissed.
+    #[test]
+    fn phase2_dismisses_even_when_lock_fails() {
+        let failing = FailingLocker::new();
+        let calls = failing.calls.clone();
+        let mut app = StubAppPhase2 {
+            locker: Box::new(failing),
+            dismissed: false,
+        };
+        app.phase2_input();
+        assert!(
+            app.dismissed,
+            "Phase 2 must dismiss the saver even when the locker fails"
+        );
+        assert_eq!(
+            calls.load(Ordering::SeqCst),
+            1,
+            "lock_session should attempt the lock once"
+        );
+    }
+
+    /// `dismiss` (input path) and `dpms_handoff` (Phase 3 path) must land on
+    /// *different* re-arm intents — `Immediate` for input, `AfterActive` for
+    /// Phase 3 — so `run_daemon` can route them to the matching `IdleSource`
+    /// primitive (Q4: avoid the post-Phase-3 race against the compositor's
+    /// own idle blank).
+    ///
+    /// They also differ structurally: `dismiss` drops the whole `Saver`,
+    /// while `dpms_handoff` keeps the surface and takes only the inhibitor
+    /// so the desktop is never exposed during the compositor's blank-
+    /// countdown window.
+    ///
+    /// `HowanApp` itself cannot be constructed without a live Wayland
+    /// connection, but only the `saver` / `pending_rearm` fields participate
+    /// in the dismiss/handoff logic, so a small stub mirrors that shape
+    /// exactly (including a `SaverStub` whose `inhibitor` slot models the
+    /// `Saver::inhibitor` field).
+    #[test]
+    fn dismiss_and_dpms_handoff_set_distinct_rearm_intents() {
+        use super::RearmIntent;
+
+        struct SaverStub {
+            inhibitor: Option<()>,
+        }
+        struct StubApp {
+            saver: Option<SaverStub>,
+            pending_rearm: Option<RearmIntent>,
+        }
+        impl StubApp {
+            // Mirrors `HowanApp::dismiss`: drop the whole saver.
+            fn dismiss(&mut self) {
+                if self.saver.take().is_some() {
+                    self.pending_rearm = Some(RearmIntent::Immediate);
+                }
+            }
+            // Mirrors `HowanApp::dpms_handoff`: keep the saver, take and
+            // drop only the inhibitor.
+            fn dpms_handoff(&mut self) {
+                if let Some(saver) = self.saver.as_mut() {
+                    let _ = saver.inhibitor.take();
+                    self.pending_rearm = Some(RearmIntent::AfterActive);
+                }
+            }
+        }
+
+        // Input dismiss → immediate re-arm, surface gone.
+        let mut app = StubApp {
+            saver: Some(SaverStub {
+                inhibitor: Some(()),
+            }),
+            pending_rearm: None,
+        };
+        app.dismiss();
+        assert_eq!(app.pending_rearm, Some(RearmIntent::Immediate));
+        assert!(app.saver.is_none());
+
+        // Phase 3 handoff → re-arm gated on the next user-active transition,
+        // surface still up, inhibitor gone.
+        let mut app = StubApp {
+            saver: Some(SaverStub {
+                inhibitor: Some(()),
+            }),
+            pending_rearm: None,
+        };
+        app.dpms_handoff();
+        assert_eq!(app.pending_rearm, Some(RearmIntent::AfterActive));
+        assert!(
+            app.saver.is_some(),
+            "dpms_handoff must NOT drop the saver surface — keeping it mapped \
+             is what hides the desktop during the compositor's blank window"
+        );
+        assert!(
+            app.saver.as_ref().unwrap().inhibitor.is_none(),
+            "dpms_handoff must take and destroy the inhibitor"
+        );
+
+        // Both are idempotent — calling again after the saver is already
+        // gone leaves the intent alone (avoids overwriting the right kind
+        // of re-arm if a stray event fires after dismiss).
+        let mut app = StubApp {
+            saver: None,
+            pending_rearm: Some(RearmIntent::AfterActive),
+        };
+        app.dismiss();
+        assert_eq!(app.pending_rearm, Some(RearmIntent::AfterActive));
+        app.dpms_handoff();
+        assert_eq!(app.pending_rearm, Some(RearmIntent::AfterActive));
+    }
+
+    /// After `dpms_handoff` runs, an input event arriving on the still-mapped
+    /// saver routes through the Phase 3 arm of `on_input`, which dismisses
+    /// the saver (drops the surface) and overrides the pending re-arm intent
+    /// from `AfterActive` (set by the handoff) to `Immediate` (the user is
+    /// back, so the next idle cycle starts cleanly). This is the new
+    /// reachable path that the surface-retention change introduces.
+    ///
+    /// `HowanApp` itself cannot be constructed in CI (no live Wayland), so a
+    /// stub mirrors the relevant fields and the two methods' bodies verbatim.
+    #[test]
+    fn input_after_dpms_handoff_dismisses_and_overrides_to_immediate() {
+        use super::RearmIntent;
+
+        struct SaverStub {
+            inhibitor: Option<()>,
+            shown_at: Instant,
+        }
+        impl SaverStub {
+            fn phase(&self, now: Instant, t_grace: Duration, t_dpms: Duration) -> SaverPhase {
+                let elapsed = now.saturating_duration_since(self.shown_at);
+                if elapsed >= t_dpms {
+                    SaverPhase::Phase3
+                } else if elapsed >= t_grace {
+                    SaverPhase::Phase2
+                } else {
+                    SaverPhase::Phase1
+                }
+            }
+        }
+        struct StubApp {
+            saver: Option<SaverStub>,
+            pending_rearm: Option<RearmIntent>,
+            t_grace: Duration,
+            t_dpms: Duration,
+        }
+        impl StubApp {
+            // Mirrors `HowanApp::dpms_handoff`.
+            fn dpms_handoff(&mut self) {
+                if let Some(saver) = self.saver.as_mut() {
+                    let _ = saver.inhibitor.take();
+                    self.pending_rearm = Some(RearmIntent::AfterActive);
+                }
+            }
+            // Mirrors `HowanApp::dismiss`.
+            fn dismiss(&mut self) {
+                if self.saver.take().is_some() {
+                    self.pending_rearm = Some(RearmIntent::Immediate);
+                }
+            }
+            // Mirrors `HowanApp::on_input` with the same three arms in the
+            // same order. The Phase 2 arm normally also calls
+            // `lock_session`, but this test only exercises Phase 3 (and the
+            // lock-session contract is already covered by a separate test),
+            // so the stub omits that side effect and keeps each arm as a
+            // bare `dismiss()`.
+            fn on_input(&mut self, now: Instant) {
+                let Some(saver) = self.saver.as_ref() else {
+                    return;
+                };
+                match saver.phase(now, self.t_grace, self.t_dpms) {
+                    SaverPhase::Phase1 => self.dismiss(),
+                    SaverPhase::Phase2 => self.dismiss(),
+                    SaverPhase::Phase3 => self.dismiss(),
+                }
+            }
+        }
+
+        let shown_at = Instant::now();
+        let t_grace = Duration::from_secs(30);
+        let t_dpms = Duration::from_secs(60);
+        let mut app = StubApp {
+            saver: Some(SaverStub {
+                inhibitor: Some(()),
+                shown_at,
+            }),
+            pending_rearm: None,
+            t_grace,
+            t_dpms,
+        };
+
+        // Handoff at T_dpms: surface stays, inhibitor gone, AfterActive set.
+        app.dpms_handoff();
+        assert!(app.saver.is_some());
+        assert!(app.saver.as_ref().unwrap().inhibitor.is_none());
+        assert_eq!(app.pending_rearm, Some(RearmIntent::AfterActive));
+
+        // Input at `shown_at + t_dpms` lands in the Phase 3 arm of
+        // `on_input`. The arm dismisses → surface gone, Immediate
+        // overrides AfterActive.
+        app.on_input(shown_at + t_dpms);
+        assert!(
+            app.saver.is_none(),
+            "Phase 3 input must dismiss the surface"
+        );
+        assert_eq!(
+            app.pending_rearm,
+            Some(RearmIntent::Immediate),
+            "Phase 3 input must override the AfterActive intent with Immediate"
+        );
     }
 }

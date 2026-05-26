@@ -26,10 +26,13 @@ use daemon::mutter::MutterIdleSource;
 
 fn main() -> ExitCode {
     let result = match Cli::parse().into_command() {
-        Command::Daemon(args) => {
-            let idle_source = Box::new(MutterIdleSource::new(args.idle_timeout()));
-            app::run_daemon(idle_source)
-        }
+        Command::Daemon(args) => match args.validate() {
+            Ok(()) => {
+                let idle_source = Box::new(MutterIdleSource::new(args.idle_timeout()));
+                app::run_daemon(idle_source, args.grace_timeout(), args.dpms_timeout())
+            }
+            Err(msg) => Err(msg.into()),
+        },
         Command::Start => app::run(),
         Command::Stop => pidfile::stop(),
     };
