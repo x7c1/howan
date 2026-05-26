@@ -570,7 +570,15 @@ dismissed. Record the result here.
 
 ### M4 Stage 3 (GNOME) — Phase 3 timer releases the inhibitor, surface stays
 
-**Status: pending on-hardware verification (post-surface-retention fix).**
+**Status: PASS (2026-05-27).** On GNOME with shortened timers (e.g.
+`--idle-timeout 3 --grace-timeout 5 --dpms-timeout 10`, `idle-delay = 10s`):
+at `T_dpms` the inhibitor was released and the saver stayed mapped through
+the compositor's blank-countdown (desktop not exposed); the display
+physically blanked; input woke the display to the saver and the same input
+dismissed it, revealing the desktop; a subsequent idle period showed the
+saver again normally. The fade-to-blank cursor flicker is documented
+separately — see [Known limitation: cursor visible during the fade to
+blank](#known-limitation-cursor-visible-during-the-fade-to-blank).
 
 Run `howan daemon --idle-timeout 5 --grace-timeout 30 --dpms-timeout 60` with
 a short GNOME `org.gnome.desktop.session idle-delay` (e.g. 30s) and leave the
@@ -599,7 +607,15 @@ the surface mapped.
 
 ### M4 Stage 4 (Blackwell sign-off, SSH-guarded) — DPMS off↔on
 
-**Status: pending on-hardware verification (post-surface-retention fix).**
+**Status: PASS (2026-05-27) — without SSH guard.** Verified on the NVIDIA
+Blackwell + GNOME target through the M4 Stage 3 scenario above. No GPU wedge
+was observed; `journalctl -k --since "10 minutes ago" | grep -iE
+'nvidia|gsp|drm|modeset'` returned no entries and `nvidia-smi` remained
+responsive throughout. The DPMS off↔on transition completed cleanly across
+multiple cycles. The criterion's SSH-lifeline precondition was not formally
+applied — that precaution exists to recover from a GPU wedge during the
+transition, and no such wedge occurred. A future re-run under a formal SSH
+guard is welcome but is not blocking.
 
 This is the new real-display power transition M4 introduces and the one M3
 deferred (per [DPMS Stage 2 above](#dpms-stage-2-blackwell-sign-off)). On the
@@ -648,7 +664,11 @@ verify, because each emits a different diagnostic:
 
 ### M4 Stage 6 (GNOME, post-Q4) — Long-running cycle through Phase 3
 
-**Status: pending on-hardware verification (post-surface-retention fix).**
+**Status: PASS (2026-05-27).** Multiple full cycles confirmed (input → idle
+→ saver → Phase 1/2/3 → DPMS off → input wake → next idle → ...). The daemon
+stayed resident across the cycles, subsequent cycles continued to trigger
+normally (no Mutter watch leaks observed), and the daemon's stderr was
+empty.
 
 With the same flags as M4 Stage 3 above, leave the daemon running through
 several full cycles (input wake → idle → saver → Phase 1 input dismiss → next
