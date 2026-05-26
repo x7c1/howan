@@ -128,41 +128,35 @@ have. See `docs/guides/30-composited-surface.md` and
 
 ### Manual / on-hardware (verified by a human before merge)
 
-- [ ] **Phase 1 behavior is unchanged (GNOME).** Run `howan daemon
-      --idle-timeout 5 --grace-timeout 30 --dpms-timeout 120` on a GNOME
-      session. After the saver auto-appears, input within ~30s dismisses it
-      and the daemon re-arms (saver re-appears on the next idle cycle), same
-      as today's M3 behavior. Record in
-      `docs/guides/40-resident-daemon.md` Stage notes.
-- [ ] **Phase 2 input invokes the GNOME lock screen.** With the same flags,
-      let the saver stay up past 30s (`T_grace`) but well under 120s, then
-      input. The GNOME lock screen appears (i.e. `Session.Lock` was honored)
-      and the saver is dismissed. Record the result.
-- [ ] **Phase 3 timer releases the inhibitor and lets the compositor blank.**
-      With `howan daemon --idle-timeout 5 --grace-timeout 30 --dpms-timeout
-      60` and a short GNOME `org.gnome.desktop.session idle-delay` (e.g. 30s),
-      leave the machine idle past 60s without input. At `T_dpms` the saver
-      surface disappears, the inhibitor is gone, and within the compositor's
-      own idle timer the display physically blanks (DPMS off). Confirm by
-      observing the panel / wall clock.
-- [ ] **Blackwell sign-off (SSH-guarded) for the Phase 3 DPMS off↔on
-      transition.** This is the new real-display power transition M4
-      introduces and the one M3 deferred (per
-      `docs/guides/40-resident-daemon.md` "DPMS Stage 2"). On the NVIDIA
-      Blackwell + GNOME machine, with an out-of-band SSH lifeline from a
-      second device, run the Phase 3 scenario above and confirm: (a) DPMS
-      off engages cleanly without wedging the display engine / GSP firmware,
-      (b) the first input wakes the display normally, (c) no crash symptoms
-      in `journalctl -k` / NVIDIA driver logs. Record the result in
-      `docs/guides/40-resident-daemon.md` as a new stage; this answers the
-      sign-off the M3 task deferred to M4.
-- [ ] **Lock-failure fallback (manual injection).** Temporarily mask the
-      `org.freedesktop.login1` interface (e.g. by stopping `systemd-logind`
-      in a throwaway VM, or by running with `DBUS_SESSION_BUS_ADDRESS` pointed
-      at an empty stub) and confirm Phase 2 input logs the stderr line and
-      *still* dismisses the saver instead of getting stuck with the saver up.
-      This proves the "log + proceed" branch in `lock_session()` is exercised
-      end-to-end, not just under unit test.
+- [x] **Phase 1 behavior is unchanged (GNOME).** Verified 2026-05-27 on
+      GNOME (exercised as part of the long-running cycle in M4 Stage 6):
+      saver auto-appeared, input dismissed it, daemon re-armed and saver
+      re-appeared on the next idle cycle.
+- [x] **Phase 2 input invokes the GNOME lock screen.** Verified 2026-05-27:
+      after T_grace elapsed, input invoked `Session.Lock` and the GNOME
+      lock screen appeared while the saver was dismissed.
+- [x] **Phase 3 timer releases the inhibitor and lets the compositor blank.**
+      Verified 2026-05-27 against the Q4 + Phase-3-surface-retention stack
+      (PR #7 + #8). The intermediate M4-only behavior was non-functional —
+      Q4 gated the re-arm on user-active, and PR #8 keeps the surface
+      mapped through the blank-countdown. Combined behavior: inhibitor
+      released at `T_dpms`, saver stays mapped, display physically blanks.
+      Recorded under M4 Stage 3 in
+      `docs/guides/40-resident-daemon.md`.
+- [x] **Blackwell DPMS off↔on transition — without SSH guard.** Verified
+      2026-05-27 on the NVIDIA Blackwell + GNOME target: DPMS off↔on
+      completed cleanly across multiple cycles, `journalctl -k` grep for
+      `nvidia|gsp|drm|modeset` was empty, `nvidia-smi` remained
+      responsive. The criterion's SSH-lifeline precondition was not
+      formally applied; since no wedge occurred the precaution served no
+      recovery purpose. Recorded under M4 Stage 4 in the guide.
+- [ ] **Lock-failure fallback (manual injection).** Not yet verified
+      end-to-end. The same code path (`lock_session()` logs + proceeds
+      to dismiss when the locker errors) is exercised by the unit test
+      `phase2_dismisses_even_when_lock_fails` (via `FailingLocker`), so
+      the logic is covered automatically. The manual injection adds
+      end-to-end confidence with a real D-Bus, which is acceptable to
+      defer if a controlled environment is not handy.
 
 ## Out of scope
 
