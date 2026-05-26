@@ -312,6 +312,7 @@ impl PointerHandler for HowanApp {
             match event.kind {
                 PointerEventKind::Enter { serial } => {
                     pointer.set_cursor(serial, None, 0, 0);
+                    self.last_pointer_enter_serial = Some(serial);
                 }
                 PointerEventKind::Motion { .. } | PointerEventKind::Press { .. } => {
                     self.on_input();

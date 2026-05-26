@@ -337,6 +337,19 @@ pub(crate) struct HowanApp {
     pub(crate) keyboard: Option<WlKeyboard>,
     pub(crate) pointer: Option<WlPointer>,
     pub(crate) touch: Option<WlTouch>,
+    /// The serial of the most recent `wl_pointer.enter` event delivered to the
+    /// saver surface, cached so [`dpms_handoff`] can re-issue
+    /// `wl_pointer.set_cursor` with a null cursor. The initial Enter (handled in
+    /// `app/handlers.rs`) hides the cursor for the saver's lifetime, but Mutter
+    /// re-evaluates seat state when the idle inhibitor is destroyed and renders
+    /// its default cursor on top of the still-mapped saver in the Phase 3
+    /// → DPMS-off window. Re-applying the null cursor with the cached serial at
+    /// `dpms_handoff` keeps the saver visually clean through that window. `None`
+    /// until the first Enter on the saver, in which case no re-apply is possible
+    /// (and the cursor was already not hidden, matching pre-task behavior).
+    ///
+    /// [`dpms_handoff`]: HowanApp::dpms_handoff
+    pub(crate) last_pointer_enter_serial: Option<u32>,
     /// The output the saver surface is shown on. We track the output the
     /// surface entered ("active output only"); until a surface-enter event
     /// arrives we fall back to the first advertised output.
@@ -505,6 +518,7 @@ impl HowanApp {
             locker,
             exit: false,
             pending_rearm: None,
+            last_pointer_enter_serial: None,
         })
     }
 
@@ -697,6 +711,19 @@ impl HowanApp {
         if let Some(saver) = self.saver.as_mut() {
             if let Some(inhibitor) = saver.inhibitor.take() {
                 inhibitor.destroy();
+            }
+            // Re-apply the null cursor for the saver surface. The initial Enter
+            // hides the cursor (see `app/handlers.rs`), but Mutter re-evaluates
+            // seat state when the idle inhibitor is destroyed and renders its
+            // default cursor on top of the still-mapped saver until DPMS off.
+            // Re-issuing `set_cursor` with the cached Enter serial keeps the
+            // saver visually clean through the compositor's blank window. When
+            // the pointer has not yet entered the saver (`last_pointer_enter_serial
+            // == None`) there is nothing to re-apply.
+            if let (Some(pointer), Some(serial)) =
+                (self.pointer.as_ref(), self.last_pointer_enter_serial)
+            {
+                pointer.set_cursor(serial, None, 0, 0);
             }
             self.pending_rearm = Some(RearmIntent::AfterActive);
         }
