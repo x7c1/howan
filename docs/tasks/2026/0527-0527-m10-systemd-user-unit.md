@@ -159,10 +159,29 @@ config-file driven tuning is M11.
       input within `T_grace`.
 - [ ] **Phase 2 cycle is visible in the journal.** With the saver up
       past `T_grace` but before `T_dpms`, input produces `input received
-      phase=Phase2` followed by `lock-session issued` (or
+      phase=Phase2` followed by `lock-session issued, waiting for
+      LockedHint`, then `locked hint observed elapsed_ms=...` (or
       `lock-session failed reason=...` and the saver still dismisses,
       per the log + proceed contract) and then the same dismiss /
       re-arm tail as Phase 1.
+- [ ] **Phase 2 dismiss transitions to GNOME lock screen with no
+      visible black gap.** Drive a Phase 2 input on a real GNOME session
+      and observe the screen: the saver must stay up until the lock
+      screen surface mounts on top of it; there must be no
+      multi-second black-screen interval between the saver going away
+      and the lock UI appearing. This is the LockedHint-wait
+      verification (Q3 in the howan plan); the corresponding daemon
+      flow is documented in
+      [`docs/guides/40-resident-daemon.md`](../../guides/40-resident-daemon.md)
+      (Waiting for `LockedHint` before dismissing).
+- [ ] **When `LockedHint` is not observed within 3 s, the journal
+      contains the WARN `locked hint not observed within timeout`.**
+      Reproduce by masking GNOME Shell's lock UI (e.g. running on a
+      compositor without `SetLockedHint` support, or temporarily
+      blocking the `SetLockedHint` D-Bus call), driving a Phase 2
+      input, and confirming `journalctl --user -u howan.service`
+      shows the WARN with `timeout_ms=3000`. The saver must still be
+      dismissed (log + proceed contract).
 - [ ] **Phase 3 cycle is visible in the journal.** Leaving the saver
       idle past `T_dpms` produces `phase transition 2->3` followed by
       `inhibitor released reason=dpms_handoff` and `dpms handoff:

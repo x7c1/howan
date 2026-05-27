@@ -195,12 +195,18 @@ we are already in Phase 2, exactly at `T_dpms` we are already in Phase 3
   behavior. This is the common case.
 - **Phase 2 — lock handoff.** From `T_grace` to `T_dpms`. Input calls
   `org.freedesktop.login1.Session.Lock` on the current session (the D-Bus
-  equivalent of `loginctl lock-session`), then dismisses the saver. The
-  compositor's lock screen takes over from there — howan never draws an
-  auth surface itself (non-goal: no own locker). The lock call is
-  fire-and-forget; if it fails the daemon logs a single `howan: lock-session
-  failed: <cause>` line to stderr and **still proceeds to dismiss** so the
-  user is never left staring at a saver they cannot get out of.
+  equivalent of `loginctl lock-session`), then **waits for the compositor
+  to confirm its lock surface has mounted** (the
+  `org.freedesktop.login1.Session.LockedHint` property flipping to `true`,
+  with a 3 s timeout fallback — see [Waiting for `LockedHint` before
+  dismissing](#waiting-for-lockedhint-before-dismissing)), then dismisses
+  the saver. The compositor's lock screen takes over from there — howan
+  never draws an auth surface itself (non-goal: no own locker). The lock
+  call itself is fire-and-forget; if it fails the daemon logs a single
+  `howan: lock-session failed: <cause>` line to stderr, **skips the wait**
+  (there is no compositor work to observe), and **still proceeds to
+  dismiss** so the user is never left staring at a saver they cannot get
+  out of.
 - **Phase 3 — DPMS handoff.** At `T_dpms`. A calloop `Timer` armed when
   the saver was shown fires and calls `HowanApp::dpms_handoff()`, which
   destroys the idle inhibitor (the same `zwp_idle_inhibitor_v1.destroy`
@@ -247,6 +253,43 @@ caller's current session without depending on `XDG_SESSION_ID`. If logind
 is unreachable at startup (a non-systemd session), the daemon falls back
 to a no-op locker so it still runs — Phase 2 then behaves like Phase 1,
 which is strictly safer than refusing to start.
+
+#### Waiting for `LockedHint` before dismissing
+
+`Session.Lock` returns to howan as soon as logind has forwarded the
+request — typically within a millisecond — but on GNOME the compositor
+still needs hundreds of ms to several seconds to mount its
+`ext-session-lock-v1` lock surface and start rendering. Dismissing the
+saver before that lock surface is up exposes a several-second black gap
+between howan's saver disappearing and the lock screen appearing.
+Because howan's saver is a composited (non-fullscreen) overlay, the
+panel chrome stays visible beside it, so the gap is jarring and reads
+as "something is broken" rather than a smooth handoff.
+
+The Phase 2 input handler therefore waits for
+`org.freedesktop.login1.Session.LockedHint` to flip to `true` before
+dropping the saver — GNOME Shell calls `SetLockedHint(true)` on the
+session as soon as it has mounted the lock surface, so the property
+change is the canonical "lock screen is now up" signal. The
+`ext-session-lock-v1` surface sits on the topmost layer, so by the time
+the hint flips the lock UI is already covering the saver; dismissing
+afterwards is invisible. A 3 s timeout guards the case where the hint
+never flips (logind masked, GNOME Shell not running, GNOME version
+without `SetLockedHint`); the saver is dismissed anyway and the
+timeout is logged at WARN
+(`locked hint not observed within timeout timeout_ms=3000`) so the
+journal surfaces the regression.
+
+The wait is implemented in `crates/howan/src/app/lock.rs` behind a
+small `LockSurveillance` trait so unit tests can inject success /
+timeout / unreachable stubs and exercise the three branches of
+`on_input`'s Phase 2 arm without driving real D-Bus. The actual
+property-change subscription runs on a helper thread that forwards
+the value through an `std::sync::mpsc` channel; the main thread does
+`recv_timeout(3 s)`, so the Wayland event loop is held for at most
+the timeout even when the bus stalls. The saver keeps its compositor-
+attached buffer up across the wait window — Mutter has something to
+draw until the lock surface mounts on top of it.
 
 The composited-surface invariants from [30-composited-surface.md](30-composited-surface.md)
 and the inhibitor lifetime from [Suppressing DPMS while the saver is
@@ -512,14 +555,25 @@ idle detected            t1_ms=...
 saver shown              inhibitor_acquired=true
 inhibitor acquired
 input received           phase=Phase2 elapsed_since_shown_ms=...
-lock-session issued
+lock-session issued, waiting for LockedHint
+locked hint observed     elapsed_ms=...
 saver dismissed          elapsed_since_shown_ms=...
 inhibitor released       reason=dismiss
 idle watch armed         trigger=dismiss interval_ms=...
 ```
 
-Phase-1 differs only in the `phase=Phase1` value and the missing
-`lock-session issued` line.
+If the compositor never flips the hint within 3 s (logind masked, GNOME
+Shell not running, etc.), the `locked hint observed` line is replaced
+by a WARN:
+
+```
+locked hint not observed within timeout    timeout_ms=3000
+```
+
+Phase 1 differs only in the `phase=Phase1` value and the missing
+`lock-session issued, waiting for LockedHint` / `locked hint observed`
+lines — Phase 1 input dismisses the saver immediately without going
+through the lock-session handshake.
 
 ### What a Phase-3 DPMS handoff looks like
 
@@ -570,6 +624,8 @@ The deterministic checks below run in the canonical
 | `Saver::phase` boundaries (below `T_grace`, at `T_grace`, at `T_dpms`)   | PASS (unit tests in `app.rs`) |
 | `on_input` no-ops when no saver is shown                                | PASS (unit test in `app.rs`) |
 | Phase 2 dismisses even when the locker fails (log + proceed contract)   | PASS (unit test in `app.rs` with a `FailingLocker` stub) |
+| Phase 2 waits for `LockedHint`, then dismisses (success path)           | PASS (unit test in `app.rs` with an `ObservedSurveillance` stub) |
+| Phase 2 dismisses on `LockedHint` timeout and logs WARN                 | PASS (unit test in `app.rs` with a `TimedOutSurveillance` stub) |
 
 Fast-fail diagnostics (manual, no surface mapped):
 
@@ -711,7 +767,11 @@ above](#stage-1-safe--live-gnome-idle-cycle). Record the result here.
 With the same flags as M4 Stage 1, let the saver stay up past 30s (`T_grace`)
 but well under 120s, then input. The GNOME lock screen must appear (proving
 `org.freedesktop.login1.Session.Lock` was honored) and the saver must be
-dismissed. Record the result here.
+dismissed. The transition must be **visually clean** — no several-second
+black gap between the saver disappearing and the lock screen appearing
+(the saver stays up until `LockedHint=true`, see [Waiting for `LockedHint`
+before dismissing](#waiting-for-lockedhint-before-dismissing)). Record the
+result here.
 
 ### M4 Stage 3 (GNOME) — Phase 3 timer releases the inhibitor, surface stays
 
