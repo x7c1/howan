@@ -193,7 +193,7 @@ config-file driven tuning is M11.
   `phase2_dismisses_on_locked_hint_timeout` in
   `crates/howan/src/app/lock.rs`, exercised by `cargo test` in the
   pipeline `check_command`.
-- [ ] **Phase 3 cycle is visible in the journal.** Leaving the saver
+- [x] **Phase 3 cycle is visible in the journal.** Leaving the saver
       idle past `T_dpms` produces `phase transition 2->3` followed by
       `inhibitor released reason=dpms_handoff` and `dpms handoff:
       saver surface retained`. After the next real user activity the
@@ -224,7 +224,7 @@ config-file driven tuning is M11.
       disabled so Phase 3 DPMS handoff will not blank the screen, and
       recommends a concrete `gsettings set ... 'uint32 <T1+60>'`
       command. Install still succeeds.
-- [ ] **`make install` skips the check silently when `gsettings` is
+- [x] **`make install` skips the check silently when `gsettings` is
       unavailable.** On a system without `gsettings` (or with the GNOME
       schema absent), the check prints a single informational line
       mentioning that it was skipped — **no** `WARNING:` lines — and
