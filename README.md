@@ -12,6 +12,56 @@ Pre-1.0. Under active development.
 cargo build
 ```
 
+## Install
+
+Install howan as a systemd `--user` service:
+
+```bash
+git clone https://github.com/x7c1/howan.git
+cd howan
+make install
+```
+
+This runs [`packaging/install.sh`](packaging/install.sh), which builds
+the binary into `~/.cargo/bin` via `cargo install --path crates/howan`,
+copies [`packaging/systemd/howan.service`](packaging/systemd/howan.service)
+to `~/.config/systemd/user/howan.service`, then reloads, enables, and
+restarts the unit.
+
+To remove:
+
+```bash
+make uninstall
+```
+
+This runs [`packaging/uninstall.sh`](packaging/uninstall.sh), which is
+idempotent.
+
+### Inspecting the service
+
+```bash
+systemctl --user status howan.service          # current state
+journalctl --user -u howan.service             # logs
+journalctl --user -u howan.service -f          # follow logs live
+```
+
+### Overriding CLI flags
+
+The unit launches `howan daemon` with no flags, so it uses the built-in
+defaults (`T1=5min`, `T_grace=60min`, `T_dpms=120min`). To override, edit
+`~/.config/systemd/user/howan.service`, then reload and restart:
+
+```bash
+systemctl --user daemon-reload
+systemctl --user restart howan.service
+```
+
+Note: a subsequent `make install` overwrites
+`~/.config/systemd/user/howan.service` with the copy from this repo,
+discarding local edits. Apply the same edit to
+[`packaging/systemd/howan.service`](packaging/systemd/howan.service) if
+you want it to survive re-install.
+
 ## Run
 
 ```bash
