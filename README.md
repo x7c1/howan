@@ -1,4 +1,4 @@
-# howan
+# Howan
 
 A lightweight Wayland screensaver written in Rust.
 
@@ -14,7 +14,7 @@ cargo build
 
 ## Install
 
-Install howan as a systemd `--user` service:
+Install Howan as a systemd `--user` service:
 
 ```bash
 git clone https://github.com/x7c1/howan.git
