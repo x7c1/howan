@@ -36,6 +36,12 @@ Key points:
   the saver surface mapped, so the compositor's own idle blank can take over
   *behind* the saver (the desktop is never exposed) and the next input
   dismisses the surface (Phase 3). See [Phase lifecycle](#phase-lifecycle).
+- Lifecycle events (daemon start, idle detected, saver shown, phase
+  transitions, inhibitor acquired/released, shutdown) are emitted via
+  `tracing` to stderr, which the systemd `--user` unit captures into the
+  journal. See [Verifying the daemon via the
+  journal](#verifying-the-daemon-via-the-journal) for the commands and
+  worked examples.
 
 The composited-surface invariants the saver relies on (no `set_fullscreen`, no
 opaque region — the Blackwell safety rationale) are **not** repeated here; see
@@ -403,6 +409,88 @@ to use and is what gates the next idle watch — see [Post-Phase-3
 handoff](#post-phase-3-handoff-active-watch-gate). DPMS suppression itself is
 unaffected: the inhibitor is held only while the saver is meant to suppress
 the compositor's blank (i.e. up to `T_dpms`).
+
+## Verifying the daemon via the journal
+
+The daemon's intended workflow is "leave it running during an outing or
+overnight, then read the journal afterwards to confirm Phase 1/2/3
+behavior". Lifecycle events are emitted through `tracing` and routed to
+stderr, which the systemd `--user` unit captures into the journal.
+
+### Reading the journal
+
+```sh
+# Everything from today
+journalctl --user -u howan.service --since today
+
+# Just the recent window
+journalctl --user -u howan.service --since "2 hours ago"
+
+# Tail live
+journalctl --user -u howan.service -f
+```
+
+The default verbosity is `INFO` — enough for the lifecycle events listed
+below. For one-off debugging, override the filter at the unit level:
+
+```sh
+# In ~/.config/systemd/user/howan.service.d/override.conf (or edit the
+# unit directly), then `systemctl --user daemon-reload && systemctl
+# --user restart howan.service`:
+Environment=RUST_LOG=howan=debug
+```
+
+`RUST_LOG` follows the `tracing-subscriber` `EnvFilter` syntax; any value
+that filter accepts will work. Remove the override (or revert to
+`RUST_LOG=howan=info`, the default) when done.
+
+### What a Phase-2 lock cycle looks like
+
+A successful Phase-2 cycle — saver shows, lives past `T_grace`, input
+locks the session, daemon resumes the idle watch — leaves a trail like:
+
+```
+idle watch armed         trigger=initial interval_ms=...
+idle detected            t1_ms=...
+saver shown              inhibitor_acquired=true
+inhibitor acquired
+input received           phase=Phase2 elapsed_since_shown_ms=...
+lock-session issued
+saver dismissed          elapsed_since_shown_ms=...
+inhibitor released       reason=dismiss
+idle watch armed         trigger=dismiss interval_ms=...
+```
+
+Phase-1 differs only in the `phase=Phase1` value and the missing
+`lock-session issued` line.
+
+### What a Phase-3 DPMS handoff looks like
+
+```
+idle watch armed         trigger=initial interval_ms=...
+idle detected            t1_ms=...
+saver shown              inhibitor_acquired=true
+inhibitor acquired
+phase transition 2->3    elapsed_since_shown_ms=...
+inhibitor released       reason=dpms_handoff
+dpms handoff: saver surface retained
+user-active watch armed
+user-active watch fired
+input received           phase=Phase3 elapsed_since_shown_ms=...
+saver dismissed          elapsed_since_shown_ms=...
+idle watch armed         trigger=add_user_active_watch interval_ms=...
+```
+
+The `trigger=add_user_active_watch` field on the final `idle watch armed`
+line is the M3-vs-Q4 distinction: it proves the post-Phase-3 re-arm was
+gated on a real user-active transition rather than firing immediately
+(see [Post-Phase-3
+handoff](#post-phase-3-handoff-active-watch-gate)). The Phase 1/2 input
+path produces `trigger=dismiss` at the same call site instead.
+
+The phase model itself, the inhibitor lifetime, and the active-watch
+gate are explained in earlier sections of this guide; this section only
+covers the observability surface.
 
 ## Verification
 
