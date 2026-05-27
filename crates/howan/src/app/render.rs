@@ -17,6 +17,7 @@
 //! later milestone replaces this with a GPU-backed renderer.
 
 use smithay_client_toolkit::shm::{slot::SlotPool, Shm, ShmHandler};
+use tracing::warn;
 use wayland_client::protocol::{wl_shm, wl_surface::WlSurface};
 
 use super::HowanApp;
@@ -82,7 +83,7 @@ impl Renderer {
             {
                 Ok(pair) => pair,
                 Err(err) => {
-                    eprintln!("howan: failed to allocate shm buffer: {err}");
+                    warn!(error = %err, "failed to allocate shm buffer");
                     return;
                 }
             };
@@ -97,7 +98,7 @@ impl Renderer {
 
         surface.damage_buffer(0, 0, width, height);
         if let Err(err) = buffer.attach_to(surface) {
-            eprintln!("howan: failed to attach buffer: {err}");
+            warn!(error = %err, "failed to attach buffer");
         }
     }
 }

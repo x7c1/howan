@@ -67,6 +67,7 @@ use calloop::channel::{channel, Event as ChannelEvent};
 use calloop::signals::{Signal, Signals};
 use calloop::timer::{TimeoutAction, Timer};
 use calloop::RegistrationToken;
+use tracing::{error, info, warn};
 use smithay_client_toolkit::{
     compositor::CompositorState,
     output::OutputState,
@@ -94,10 +95,24 @@ use wayland_protocols::wp::idle_inhibit::zv1::client::{
     zwp_idle_inhibitor_v1::ZwpIdleInhibitorV1,
 };
 
-use self::lock::{LogindLocker, NoopLocker, SessionLocker};
+use self::lock::{LockSurveillance, LockedHintWait, LogindLocker, NoopLocker, SessionLocker};
 use self::render::Renderer;
 use crate::daemon::{IdleEvent, IdleSource};
 use crate::pidfile::PidFileGuard;
+
+/// Maximum time the Phase 2 input handler waits for the compositor to
+/// confirm its lock surface has mounted (via the
+/// `org.freedesktop.login1.Session.LockedHint` property flipping to `true`)
+/// before dropping the saver anyway. The wait avoids the black-screen gap
+/// between the saver disappearing and the lock screen rendering (Q3 in the
+/// howan plan); the timeout fallback ensures we still dismiss when the
+/// hint never flips (logind masked, GNOME Shell not running, etc.) rather
+/// than hanging forever. Three seconds is generous enough for a stalled
+/// Mutter mount but short enough that a genuinely-broken host does not
+/// leave the user staring at the saver — and the warn log makes the case
+/// observable through the journal. See
+/// `docs/guides/40-resident-daemon.md` (Phase lifecycle).
+const LOCKED_HINT_WAIT: Duration = Duration::from_millis(3000);
 
 /// Pre-configure starting size for the shm pool, never the intended final
 /// size. The window is resized to the active output's current mode dimensions
@@ -131,8 +146,9 @@ pub fn run() -> Result<(), Box<dyn Error>> {
     insert_signal_source(&loop_handle)?;
 
     // The one-shot `start` path exits on the first input, so it never reaches
-    // Phase 2 or Phase 3 in practice. Pass a `NoopLocker` directly instead of
-    // calling `build_locker()` — there is no point paying the D-Bus connect +
+    // Phase 2 or Phase 3 in practice. Pass `NoopLocker` directly for both the
+    // locker and the lock-surveillance half instead of calling
+    // `build_lock_handles()` — there is no point paying the D-Bus connect +
     // `GetSession("auto")` round trip (or emitting the fallback warning on a
     // non-systemd host) for a code path that cannot run.
     let mut app = HowanApp::new(
@@ -140,6 +156,7 @@ pub fn run() -> Result<(), Box<dyn Error>> {
         &qh,
         Duration::from_secs(u64::MAX / 2),
         Duration::from_secs(u64::MAX / 2),
+        Box::new(NoopLocker),
         Box::new(NoopLocker),
     )?;
     // One-shot: show the saver immediately, then exit the process on dismiss.
@@ -179,6 +196,19 @@ pub fn run_daemon(
     t_grace: Duration,
     t_dpms: Duration,
 ) -> Result<(), Box<dyn Error>> {
+    // Lifecycle: log the effective thresholds and the selected idle backend
+    // exactly once at the top of the daemon run so `journalctl --user -u
+    // howan.service --since ...` shows what the daemon was configured with.
+    // See docs/guides/40-resident-daemon.md ("Verifying the daemon via the
+    // journal").
+    info!(
+        backend = idle_source.backend_name(),
+        t1_secs = idle_source.t1().as_secs(),
+        t_grace_secs = t_grace.as_secs(),
+        t_dpms_secs = t_dpms.as_secs(),
+        "daemon starting"
+    );
+
     let conn = Connection::connect_to_env()?;
     let (globals, event_queue) = registry_queue_init(&conn)?;
     let qh = event_queue.handle();
@@ -209,7 +239,8 @@ pub fn run_daemon(
     // error and a non-zero exit instead of a silent hang.
     let _idle_handle = idle_source.start(idle_tx)?;
 
-    let mut app = HowanApp::new(&globals, &qh, t_grace, t_dpms, build_locker())?;
+    let (locker, locked_hint_watcher) = build_lock_handles();
+    let mut app = HowanApp::new(&globals, &qh, t_grace, t_dpms, locker, locked_hint_watcher)?;
 
     // The Phase 3 timer source. We register/cancel a calloop Timer for
     // `t_dpms` whenever the saver is shown / dismissed.
@@ -264,22 +295,32 @@ pub fn run_daemon(
     }
 
     app.release_input_handles();
+    info!("daemon shutting down");
     Ok(())
 }
 
-/// Construct the production [`SessionLocker`]. A failure (e.g. logind is not
-/// reachable on a non-systemd session) falls back to a no-op locker so the
-/// daemon still runs — Phase 2 then behaves like Phase 1, which is strictly
-/// safer than refusing to start.
-fn build_locker() -> Box<dyn SessionLocker> {
+/// Construct the production [`SessionLocker`] **and** [`LockSurveillance`]
+/// pair. Both halves are served by the same [`LogindLocker`] value (cloned
+/// once so the two trait objects do not share a `&mut` borrow), keeping the
+/// single D-Bus connection / session-path resolution behind both calls.
+///
+/// A construction failure (e.g. logind is not reachable on a non-systemd
+/// session) falls back to a pair of [`NoopLocker`] handles so the daemon
+/// still runs — Phase 2 then behaves like Phase 1, which is strictly safer
+/// than refusing to start. The fallback `LockSurveillance` reports
+/// `TimedOut` immediately, but in this configuration the call site skips
+/// the wait entirely because `SessionLocker::lock` returns `Ok` from
+/// [`NoopLocker`] (degrading to Phase 1 directly).
+fn build_lock_handles() -> (Box<dyn SessionLocker>, Box<dyn LockSurveillance>) {
     match LogindLocker::new() {
-        Ok(locker) => Box::new(locker),
+        Ok(locker) => (Box::new(locker.clone()), Box::new(locker)),
         Err(err) => {
-            eprintln!(
-                "howan: systemd-logind session lock unavailable ({err}); \
+            warn!(
+                error = %err,
+                "systemd-logind session lock unavailable; \
                  Phase 2 input will dismiss the saver without locking"
             );
-            Box::new(NoopLocker)
+            (Box::new(NoopLocker), Box::new(NoopLocker))
         }
     }
 }
@@ -371,6 +412,14 @@ pub(crate) struct HowanApp {
     /// test stub can be injected — the production implementation is
     /// [`lock::LogindLocker`].
     locker: Box<dyn SessionLocker>,
+    /// Observer that waits for the compositor to confirm its lock surface has
+    /// mounted (via `org.freedesktop.login1.Session.LockedHint` flipping to
+    /// `true`) before the Phase 2 input branch drops the saver. Held as a
+    /// separate trait object from `locker` so each half can be stubbed
+    /// independently in tests (success / timeout / unreachable-on-lock-
+    /// failure). The production implementation is the same
+    /// [`lock::LogindLocker`] value, cloned by `build_lock_handles`.
+    locked_hint_watcher: Box<dyn LockSurveillance>,
     /// Set by the `SIGTERM`/`SIGINT` handler to terminate the whole process.
     /// Input dismiss does **not** set this — it only drops `saver`.
     exit: bool,
@@ -473,6 +522,7 @@ impl HowanApp {
         t_grace: Duration,
         t_dpms: Duration,
         locker: Box<dyn SessionLocker>,
+        locked_hint_watcher: Box<dyn LockSurveillance>,
     ) -> Result<Self, Box<dyn Error>> {
         let compositor = CompositorState::bind(globals, qh)
             .map_err(|err| format!("wl_compositor not available: {err}"))?;
@@ -491,8 +541,9 @@ impl HowanApp {
         {
             Ok(manager) => Some(manager),
             Err(err) => {
-                eprintln!(
-                    "howan: idle-inhibit manager unavailable ({err}); \
+                warn!(
+                    error = %err,
+                    "idle-inhibit manager unavailable; \
                      the saver will still show but the compositor may blank the display behind it"
                 );
                 None
@@ -516,6 +567,7 @@ impl HowanApp {
             t_grace,
             t_dpms,
             locker,
+            locked_hint_watcher,
             exit: false,
             pending_rearm: None,
             last_pointer_enter_serial: None,
@@ -535,8 +587,18 @@ impl HowanApp {
             self.idle_inhibit_manager.as_ref(),
             qh,
         ) {
-            Ok(saver) => self.saver = Some(saver),
-            Err(err) => eprintln!("howan: failed to create saver surface: {err}"),
+            Ok(saver) => {
+                let inhibitor_acquired = saver.inhibitor.is_some();
+                self.saver = Some(saver);
+                info!(
+                    inhibitor_acquired,
+                    "saver shown"
+                );
+                if inhibitor_acquired {
+                    info!("inhibitor acquired");
+                }
+            }
+            Err(err) => error!(error = %err, "failed to create saver surface"),
         }
     }
 
@@ -638,9 +700,23 @@ impl HowanApp {
     /// - A compositor-issued close request goes through `dismiss` directly
     ///   (no phase logic — the compositor's "please close" is unconditional).
     pub(crate) fn dismiss(&mut self) {
-        if self.saver.take().is_some() {
+        if let Some(saver) = self.saver.take() {
             self.active_output = None;
             self.pending_rearm = Some(RearmIntent::Immediate);
+            // If the inhibitor is still held (i.e. dismiss happened *before*
+            // the Phase 3 timer fired), `Saver`'s `Drop` will destroy it;
+            // surface that as a structured release event with the dismiss
+            // reason. After a Phase 3 handoff the field is already `None`
+            // and the corresponding release was logged at that site with
+            // reason = "dpms_handoff", so we skip the log here.
+            let elapsed_since_shown = Instant::now().saturating_duration_since(saver.shown_at);
+            info!(
+                elapsed_since_shown_ms = elapsed_since_shown.as_millis() as u64,
+                "saver dismissed"
+            );
+            if saver.inhibitor.is_some() {
+                info!(reason = "dismiss", "inhibitor released");
+            }
         }
     }
 
@@ -673,10 +749,36 @@ impl HowanApp {
             // surface; matching `dismiss`'s idempotence, this is a no-op.
             return;
         };
-        match saver.phase(Instant::now(), self.t_grace, self.t_dpms) {
+        let now = Instant::now();
+        let phase = saver.phase(now, self.t_grace, self.t_dpms);
+        let elapsed_since_shown = now.saturating_duration_since(saver.shown_at);
+        info!(
+            phase = ?phase,
+            elapsed_since_shown_ms = elapsed_since_shown.as_millis() as u64,
+            "input received"
+        );
+        match phase {
             SaverPhase::Phase1 => self.dismiss(),
             SaverPhase::Phase2 => {
-                self.lock_session();
+                if self.lock_session() {
+                    // Lock was issued. Block (up to `LOCKED_HINT_WAIT`) for
+                    // the compositor to confirm its lock surface has
+                    // actually mounted, so the saver stays up across the
+                    // 0-3 s gap between `LockSession()` returning and the
+                    // `ext-session-lock-v1` surface rendering. Without
+                    // this wait the saver would disappear immediately and
+                    // the user would see a several-second black screen
+                    // (composited saver hides the panel chrome, so the
+                    // gap is visually jarring) until Shell finished
+                    // mounting the lock UI. The wait is synchronous on
+                    // the main thread for the same reason `lock_session`
+                    // itself is: it is a single-shot bounded call per
+                    // input, not a long-running operation. The internal
+                    // implementation is a thread + channel +
+                    // `recv_timeout` to keep this call site obviously
+                    // bounded — see `LogindLocker::wait_for_locked_hint`.
+                    self.await_lock_screen();
+                }
                 self.dismiss();
             }
             SaverPhase::Phase3 => self.dismiss(),
@@ -709,6 +811,8 @@ impl HowanApp {
     /// path is left alone.
     pub(crate) fn dpms_handoff(&mut self) {
         if let Some(saver) = self.saver.as_mut() {
+            let elapsed_since_shown = Instant::now().saturating_duration_since(saver.shown_at);
+            let inhibitor_was_held = saver.inhibitor.is_some();
             if let Some(inhibitor) = saver.inhibitor.take() {
                 inhibitor.destroy();
             }
@@ -726,22 +830,73 @@ impl HowanApp {
                 pointer.set_cursor(serial, None, 0, 0);
             }
             self.pending_rearm = Some(RearmIntent::AfterActive);
+            info!(
+                elapsed_since_shown_ms = elapsed_since_shown.as_millis() as u64,
+                "phase transition 2->3"
+            );
+            if inhibitor_was_held {
+                info!(reason = "dpms_handoff", "inhibitor released");
+            }
+            info!("dpms handoff: saver surface retained");
         }
     }
 
     /// Ask logind to lock the current session via
-    /// `org.freedesktop.login1.Session.Lock`. Logs a single stderr line on
-    /// failure and returns — the caller (`on_input`) proceeds to dismiss
-    /// regardless. Tested via the injected
-    /// [`SessionLocker`](lock::SessionLocker) (see `FailingLocker`).
-    fn lock_session(&self) {
-        if let Err(err) = self.locker.lock() {
-            eprintln!("howan: lock-session failed: {err}");
+    /// `org.freedesktop.login1.Session.Lock`. Returns `true` when the call
+    /// reached logind (so the caller should wait for the compositor's lock
+    /// surface to mount via [`await_lock_screen`](HowanApp::await_lock_screen)
+    /// before dismissing the saver), `false` when the call itself errored —
+    /// in which case there is no compositor work to wait for and the caller
+    /// proceeds straight to dismiss, matching the "log + proceed" contract.
+    /// Tested via the injected [`SessionLocker`](lock::SessionLocker) (see
+    /// `FailingLocker`).
+    fn lock_session(&self) -> bool {
+        match self.locker.lock() {
+            Ok(()) => {
+                info!("lock-session issued, waiting for LockedHint");
+                true
+            }
+            Err(err) => {
+                warn!(error = %err, "lock-session failed");
+                false
+            }
+        }
+    }
+
+    /// Block (up to [`LOCKED_HINT_WAIT`]) for the compositor to confirm its
+    /// lock surface has mounted. Called from the Phase 2 input arm *after*
+    /// `lock_session` succeeds; on timeout the saver is dismissed anyway
+    /// and the timeout is logged at WARN so the journal surfaces the case.
+    ///
+    /// The wait itself is on the main (Wayland) thread, but the
+    /// [`LockSurveillance`] implementation does the actual property
+    /// polling on a helper thread and forwards the result through a
+    /// channel with a `recv_timeout`, so this call returns within
+    /// `LOCKED_HINT_WAIT` even if the bus / compositor stalls — the
+    /// Wayland event loop's next dispatch tick is held for at most that
+    /// duration. The saver itself keeps its allocated buffer up on the
+    /// compositor through the wait, so Mutter has something to draw
+    /// until the lock surface mounts on top of it.
+    fn await_lock_screen(&self) {
+        match self.locked_hint_watcher.wait_for_locked_hint(LOCKED_HINT_WAIT) {
+            LockedHintWait::Observed { elapsed } => {
+                info!(
+                    elapsed_ms = elapsed.as_millis() as u64,
+                    "locked hint observed"
+                );
+            }
+            LockedHintWait::TimedOut => {
+                warn!(
+                    timeout_ms = LOCKED_HINT_WAIT.as_millis() as u64,
+                    "locked hint not observed within timeout"
+                );
+            }
         }
     }
 
     /// Request termination of the whole process (set by the signal handler).
     fn request_exit(&mut self) {
+        info!("signal received; daemon shutting down");
         self.exit = true;
     }
 
@@ -907,12 +1062,13 @@ where
 
 #[cfg(test)]
 mod tests {
-    use std::sync::atomic::Ordering;
+    use std::sync::atomic::{AtomicU32, Ordering};
+    use std::sync::Arc;
     use std::time::{Duration, Instant};
 
     use super::lock::testing::FailingLocker;
-    use super::lock::SessionLocker;
-    use super::{make_inhibitor, SaverPhase};
+    use super::lock::{LockSurveillance, LockedHintWait, SessionLocker};
+    use super::{make_inhibitor, SaverPhase, LOCKED_HINT_WAIT};
 
     /// When the idle-inhibit manager is absent, no inhibitor is created and the
     /// `create` closure is never called — the daemon must still show the saver,
@@ -1042,33 +1198,149 @@ mod tests {
     }
 
     /// Stub mirroring just the Phase 2 branch of `HowanApp::on_input`,
-    /// without the Wayland dependencies, so the "lock failure → dismiss
-    /// still runs" contract is testable in CI. `phase2_input` always takes
-    /// the Phase 2 branch regardless of timing.
+    /// without the Wayland dependencies, so the "lock + wait, then dismiss"
+    /// contract is testable in CI. `phase2_input` always takes the Phase 2
+    /// branch regardless of timing. The wait step is invoked **only** when
+    /// the locker returns `Ok` — matching the production code, so a
+    /// `FailingLocker` paired with `UnreachableSurveillance` proves the
+    /// short-circuit holds.
     struct StubAppPhase2 {
         locker: Box<dyn SessionLocker>,
+        watcher: Box<dyn LockSurveillance>,
         dismissed: bool,
+        last_wait_outcome: Option<LockedHintWait>,
     }
     impl StubAppPhase2 {
         fn phase2_input(&mut self) {
-            // This mirrors `HowanApp::on_input`'s Phase 2 arm verbatim:
-            // call the locker, log on error, then dismiss unconditionally.
-            if let Err(err) = self.locker.lock() {
-                eprintln!("howan: lock-session failed: {err}");
+            // Mirrors `HowanApp::on_input`'s Phase 2 arm: call the locker,
+            // log on error, wait for `LockedHint` only when the lock
+            // succeeded, then dismiss unconditionally.
+            let issued = match self.locker.lock() {
+                Ok(()) => {
+                    tracing::info!("lock-session issued, waiting for LockedHint");
+                    true
+                }
+                Err(err) => {
+                    tracing::warn!(error = %err, "lock-session failed");
+                    false
+                }
+            };
+            if issued {
+                let outcome = self.watcher.wait_for_locked_hint(LOCKED_HINT_WAIT);
+                match outcome {
+                    LockedHintWait::Observed { elapsed } => {
+                        tracing::info!(
+                            elapsed_ms = elapsed.as_millis() as u64,
+                            "locked hint observed"
+                        );
+                    }
+                    LockedHintWait::TimedOut => {
+                        tracing::warn!(
+                            timeout_ms = LOCKED_HINT_WAIT.as_millis() as u64,
+                            "locked hint not observed within timeout"
+                        );
+                    }
+                }
+                self.last_wait_outcome = Some(outcome);
             }
             self.dismissed = true;
         }
     }
 
-    /// The Phase 2 contract: even when the locker errors, the saver is still
-    /// dismissed.
+    /// Phase 2 success path: `LockedHint` flips to `true` quickly. The
+    /// stub returns `Observed { elapsed: 12ms }` from `wait_for_locked_hint`;
+    /// `on_input` then dismisses the saver after observing the hint.
+    #[test]
+    fn phase2_waits_for_locked_hint_then_dismisses() {
+        use super::lock::testing::ObservedSurveillance;
+
+        struct OkLocker {
+            calls: Arc<AtomicU32>,
+        }
+        impl super::lock::SessionLocker for OkLocker {
+            fn lock(&self) -> Result<(), Box<dyn std::error::Error>> {
+                self.calls.fetch_add(1, Ordering::SeqCst);
+                Ok(())
+            }
+        }
+        let lock_calls = Arc::new(AtomicU32::new(0));
+        let watcher = ObservedSurveillance::new(Duration::from_millis(12));
+        let wait_calls = watcher.calls.clone();
+        let mut app = StubAppPhase2 {
+            locker: Box::new(OkLocker {
+                calls: lock_calls.clone(),
+            }),
+            watcher: Box::new(watcher),
+            dismissed: false,
+            last_wait_outcome: None,
+        };
+        app.phase2_input();
+        assert_eq!(lock_calls.load(Ordering::SeqCst), 1);
+        assert_eq!(
+            wait_calls.load(Ordering::SeqCst),
+            1,
+            "successful Lock must be followed by exactly one wait"
+        );
+        assert_eq!(
+            app.last_wait_outcome,
+            Some(LockedHintWait::Observed {
+                elapsed: Duration::from_millis(12),
+            }),
+        );
+        assert!(app.dismissed, "Phase 2 must dismiss after the wait");
+    }
+
+    /// Phase 2 timeout path: `LockedHint` never flips. The stub returns
+    /// `TimedOut`; `on_input` warns and still dismisses the saver so the
+    /// user is never stuck behind it.
+    #[test]
+    fn phase2_dismisses_on_locked_hint_timeout() {
+        use super::lock::testing::TimedOutSurveillance;
+
+        struct OkLocker {
+            calls: Arc<AtomicU32>,
+        }
+        impl super::lock::SessionLocker for OkLocker {
+            fn lock(&self) -> Result<(), Box<dyn std::error::Error>> {
+                self.calls.fetch_add(1, Ordering::SeqCst);
+                Ok(())
+            }
+        }
+        let lock_calls = Arc::new(AtomicU32::new(0));
+        let watcher = TimedOutSurveillance::new();
+        let wait_calls = watcher.calls.clone();
+        let mut app = StubAppPhase2 {
+            locker: Box::new(OkLocker {
+                calls: lock_calls.clone(),
+            }),
+            watcher: Box::new(watcher),
+            dismissed: false,
+            last_wait_outcome: None,
+        };
+        app.phase2_input();
+        assert_eq!(lock_calls.load(Ordering::SeqCst), 1);
+        assert_eq!(wait_calls.load(Ordering::SeqCst), 1);
+        assert_eq!(app.last_wait_outcome, Some(LockedHintWait::TimedOut));
+        assert!(
+            app.dismissed,
+            "Phase 2 must dismiss even when LockedHint never flips"
+        );
+    }
+
+    /// The Phase 2 lock-failure contract: when `Lock` errors, the wait must
+    /// be skipped entirely (no compositor work to observe), and the saver is
+    /// still dismissed.
     #[test]
     fn phase2_dismisses_even_when_lock_fails() {
+        use super::lock::testing::UnreachableSurveillance;
+
         let failing = FailingLocker::new();
         let calls = failing.calls.clone();
         let mut app = StubAppPhase2 {
             locker: Box::new(failing),
+            watcher: Box::new(UnreachableSurveillance),
             dismissed: false,
+            last_wait_outcome: None,
         };
         app.phase2_input();
         assert!(
@@ -1079,6 +1351,10 @@ mod tests {
             calls.load(Ordering::SeqCst),
             1,
             "lock_session should attempt the lock once"
+        );
+        assert!(
+            app.last_wait_outcome.is_none(),
+            "lock failure must short-circuit the LockedHint wait"
         );
     }
 

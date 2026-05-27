@@ -23,6 +23,7 @@ use smithay_client_toolkit::{
         WaylandSurface,
     },
 };
+use tracing::warn;
 use wayland_client::{
     delegate_noop,
     protocol::{
@@ -222,13 +223,13 @@ impl SeatHandler for HowanApp {
             Capability::Pointer if self.pointer.is_none() => {
                 match self.seat_state.get_pointer(qh, &seat) {
                     Ok(ptr) => self.pointer = Some(ptr),
-                    Err(err) => eprintln!("howan: failed to acquire pointer: {err}"),
+                    Err(err) => warn!(error = %err, "failed to acquire pointer"),
                 }
             }
             Capability::Touch if self.touch.is_none() => {
                 match self.seat_state.get_touch(qh, &seat) {
                     Ok(touch) => self.touch = Some(touch),
-                    Err(err) => eprintln!("howan: failed to acquire touch: {err}"),
+                    Err(err) => warn!(error = %err, "failed to acquire touch"),
                 }
             }
             _ => {}

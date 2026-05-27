@@ -18,6 +18,8 @@ use std::io::ErrorKind;
 use std::path::PathBuf;
 use std::process;
 
+use tracing::warn;
+
 const PID_FILE_NAME: &str = "howan.pid";
 
 /// Resolve the path of the PID file (`$XDG_RUNTIME_DIR/howan.pid`, or the
@@ -72,9 +74,10 @@ impl Drop for PidFileGuard {
         match fs::remove_file(&self.path) {
             Ok(()) => {}
             Err(err) if err.kind() == ErrorKind::NotFound => {}
-            Err(err) => eprintln!(
-                "howan: failed to remove pid file {}: {err}",
-                self.path.display()
+            Err(err) => warn!(
+                path = %self.path.display(),
+                error = %err,
+                "failed to remove pid file"
             ),
         }
     }
@@ -157,9 +160,10 @@ fn remove_stale(path: &std::path::Path) {
     match fs::remove_file(path) {
         Ok(()) => {}
         Err(err) if err.kind() == ErrorKind::NotFound => {}
-        Err(err) => eprintln!(
-            "howan: failed to remove stale pid file {}: {err}",
-            path.display()
+        Err(err) => warn!(
+            path = %path.display(),
+            error = %err,
+            "failed to remove stale pid file"
         ),
     }
 }

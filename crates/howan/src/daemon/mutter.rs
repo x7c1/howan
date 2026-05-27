@@ -64,6 +64,7 @@ use std::thread;
 use std::time::Duration;
 
 use calloop::channel::Sender;
+use tracing::{error, info, warn};
 use zbus::blocking::Connection;
 
 use super::{IdleEvent, IdleHandle, IdleSource};
@@ -170,6 +171,14 @@ impl MutterIdleSource {
 }
 
 impl IdleSource for MutterIdleSource {
+    fn backend_name(&self) -> &'static str {
+        "mutter"
+    }
+
+    fn t1(&self) -> Duration {
+        Duration::from_millis(self.interval_ms)
+    }
+
     fn start(&self, sender: Sender<IdleEvent>) -> Result<Box<dyn IdleHandle>, Box<dyn Error>> {
         // Validate reachability on the calling thread so the error propagates to
         // the daemon's exit code. The watch loop then runs on its own
@@ -189,7 +198,7 @@ impl IdleSource for MutterIdleSource {
             .name("howan-idle-mutter".into())
             .spawn(move || {
                 if let Err(err) = run_watch_loop(interval_ms, &sender, &thread_running, &rearm_rx) {
-                    eprintln!("howan: Mutter idle watch loop ended: {err}");
+                    error!(error = %err, "Mutter idle watch loop ended");
                 }
             })
             .map_err(|err| format!("failed to spawn idle watch thread: {err}"))?;
@@ -245,6 +254,15 @@ fn run_watch_loop(
     // at step 3 below for `RearmKind::AfterActive`), so a single slot is enough.
     let mut pending_watch: Option<u32> = None;
 
+    // Which trigger armed the *current* idle watch — `initial` on the very
+    // first arming, `dismiss` after a Phase 1 / Phase 2 input dismiss, and
+    // `add_user_active_watch` after a Phase 3 DPMS handoff (the active-watch
+    // gate fired). Recorded only as a structured field on the `idle watch
+    // armed` info event so the journal makes the re-arm path distinguishable
+    // (Q4 vs. M3) — see docs/guides/40-resident-daemon.md ("Verifying the
+    // daemon via the journal").
+    let mut next_trigger: &'static str = "initial";
+
     'cycles: loop {
         if !running.load(Ordering::Relaxed) {
             break;
@@ -255,6 +273,12 @@ fn run_watch_loop(
             .add_idle_watch(interval_ms)
             .map_err(|err| format!("AddIdleWatch failed: {err}"))?;
         pending_watch = Some(armed);
+        info!(
+            watch_id = armed,
+            interval_ms,
+            trigger = next_trigger,
+            "idle watch armed"
+        );
 
         if !wait_for_watch(&mut signals, running, armed)? {
             break 'cycles;
@@ -263,6 +287,7 @@ fn run_watch_loop(
         // Idle threshold reached: tell the daemon to show the saver. The idle
         // watch is one-shot and now consumed.
         pending_watch = None;
+        info!(t1_ms = interval_ms, "idle detected");
         if sender.send(IdleEvent::Idle).is_err() {
             // The daemon has exited; stop the loop.
             break;
@@ -288,10 +313,15 @@ fn run_watch_loop(
                 .add_user_active_watch()
                 .map_err(|err| format!("AddUserActiveWatch failed: {err}"))?;
             pending_watch = Some(active);
+            info!(watch_id = active, "user-active watch armed");
             if !wait_for_watch(&mut signals, running, active)? {
                 break 'cycles;
             }
             pending_watch = None;
+            info!("user-active watch fired");
+            next_trigger = "add_user_active_watch";
+        } else {
+            next_trigger = "dismiss";
         }
     }
 
@@ -329,7 +359,7 @@ fn wait_for_watch(
         let args = match signal.args() {
             Ok(args) => args,
             Err(err) => {
-                eprintln!("howan: malformed WatchFired signal: {err}");
+                warn!(error = %err, "malformed WatchFired signal");
                 continue;
             }
         };
