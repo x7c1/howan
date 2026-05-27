@@ -15,16 +15,24 @@
 mod app;
 mod cli;
 mod daemon;
+mod logging;
 mod pidfile;
 
 use std::process::ExitCode;
 
 use clap::Parser;
+use tracing::error;
 
 use cli::{Cli, Command};
 use daemon::mutter::MutterIdleSource;
 
 fn main() -> ExitCode {
+    // Initialize the tracing subscriber before any other work so the rest of
+    // `main` (including the daemon's startup lifecycle events) is captured by
+    // the journal when running under the systemd `--user` unit. `try_init`
+    // never panics on double-init; see `logging::init`.
+    logging::init();
+
     let result = match Cli::parse().into_command() {
         Command::Daemon(args) => match args.validate() {
             Ok(()) => {
@@ -39,7 +47,7 @@ fn main() -> ExitCode {
     match result {
         Ok(()) => ExitCode::SUCCESS,
         Err(err) => {
-            eprintln!("howan: {err}");
+            error!(error = %err, "howan exited with error");
             ExitCode::FAILURE
         }
     }

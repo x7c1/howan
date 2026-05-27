@@ -52,6 +52,20 @@ pub trait IdleHandle: Send {}
 ///
 /// [`start`]: IdleSource::start
 pub trait IdleSource {
+    /// A short, stable identifier for the backend (e.g. `"mutter"`). Used in
+    /// the daemon's startup lifecycle log line so the journal records *which*
+    /// idle backend was selected. Implementations should return a constant
+    /// string; the daemon does not parse this value.
+    fn backend_name(&self) -> &'static str;
+
+    /// The configured idle threshold (`T1`) the backend will report on. The
+    /// daemon logs this at startup so `journalctl --user -u howan.service`
+    /// records the effective value (which can be overridden via
+    /// `--idle-timeout`). The backend itself is the source of truth — keeping
+    /// this on the trait avoids threading `T1` through `run_daemon` as a
+    /// second parameter alongside the source.
+    fn t1(&self) -> Duration;
+
     /// Begin watching for idle, forwarding [`IdleEvent`]s to `sender`.
     ///
     /// Returns a handle that keeps the backend alive; dropping it stops the
@@ -115,6 +129,14 @@ mod tests {
     impl IdleHandle for FakeHandle {}
 
     impl IdleSource for FakeIdleSource {
+        fn backend_name(&self) -> &'static str {
+            "fake"
+        }
+
+        fn t1(&self) -> Duration {
+            Duration::from_secs(0)
+        }
+
         fn start(
             &self,
             sender: Sender<IdleEvent>,
@@ -202,6 +224,12 @@ mod tests {
             rearm_calls: Arc<AtomicU32>,
         }
         impl IdleSource for FallbackSource {
+            fn backend_name(&self) -> &'static str {
+                "fallback"
+            }
+            fn t1(&self) -> Duration {
+                Duration::from_secs(0)
+            }
             fn start(
                 &self,
                 _sender: Sender<IdleEvent>,

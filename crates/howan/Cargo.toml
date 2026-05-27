@@ -43,3 +43,14 @@ libc = "0.2"
 # blocking API on a dedicated thread and forward idle events into the calloop
 # loop, so no async runtime is pulled into the Wayland thread.
 zbus = "5"
+# Structured logging. The daemon is intended to run unattended under a systemd
+# `--user` unit, so lifecycle events (idle detected, saver shown, phase
+# transitions, inhibitor acquired/released, shutdown) are emitted through
+# `tracing` and rendered by `tracing-subscriber` to stderr — which systemd
+# captures into the journal. `env-filter` lets `RUST_LOG=howan=debug` raise
+# verbosity for one-off debugging without rebuilding. ANSI is disabled at
+# subscriber init because the journal is the primary sink and does not render
+# colors. See docs/guides/40-resident-daemon.md ("Verifying the daemon via
+# the journal").
+tracing = "0.1"
+tracing-subscriber = { version = "0.3", default-features = false, features = ["fmt", "env-filter"] }

@@ -67,6 +67,7 @@ use calloop::channel::{channel, Event as ChannelEvent};
 use calloop::signals::{Signal, Signals};
 use calloop::timer::{TimeoutAction, Timer};
 use calloop::RegistrationToken;
+use tracing::{error, info, warn};
 use smithay_client_toolkit::{
     compositor::CompositorState,
     output::OutputState,
@@ -179,6 +180,19 @@ pub fn run_daemon(
     t_grace: Duration,
     t_dpms: Duration,
 ) -> Result<(), Box<dyn Error>> {
+    // Lifecycle: log the effective thresholds and the selected idle backend
+    // exactly once at the top of the daemon run so `journalctl --user -u
+    // howan.service --since ...` shows what the daemon was configured with.
+    // See docs/guides/40-resident-daemon.md ("Verifying the daemon via the
+    // journal").
+    info!(
+        backend = idle_source.backend_name(),
+        t1_secs = idle_source.t1().as_secs(),
+        t_grace_secs = t_grace.as_secs(),
+        t_dpms_secs = t_dpms.as_secs(),
+        "daemon starting"
+    );
+
     let conn = Connection::connect_to_env()?;
     let (globals, event_queue) = registry_queue_init(&conn)?;
     let qh = event_queue.handle();
@@ -264,6 +278,7 @@ pub fn run_daemon(
     }
 
     app.release_input_handles();
+    info!("daemon shutting down");
     Ok(())
 }
 
@@ -275,8 +290,9 @@ fn build_locker() -> Box<dyn SessionLocker> {
     match LogindLocker::new() {
         Ok(locker) => Box::new(locker),
         Err(err) => {
-            eprintln!(
-                "howan: systemd-logind session lock unavailable ({err}); \
+            warn!(
+                error = %err,
+                "systemd-logind session lock unavailable; \
                  Phase 2 input will dismiss the saver without locking"
             );
             Box::new(NoopLocker)
@@ -491,8 +507,9 @@ impl HowanApp {
         {
             Ok(manager) => Some(manager),
             Err(err) => {
-                eprintln!(
-                    "howan: idle-inhibit manager unavailable ({err}); \
+                warn!(
+                    error = %err,
+                    "idle-inhibit manager unavailable; \
                      the saver will still show but the compositor may blank the display behind it"
                 );
                 None
@@ -535,8 +552,18 @@ impl HowanApp {
             self.idle_inhibit_manager.as_ref(),
             qh,
         ) {
-            Ok(saver) => self.saver = Some(saver),
-            Err(err) => eprintln!("howan: failed to create saver surface: {err}"),
+            Ok(saver) => {
+                let inhibitor_acquired = saver.inhibitor.is_some();
+                self.saver = Some(saver);
+                info!(
+                    inhibitor_acquired,
+                    "saver shown"
+                );
+                if inhibitor_acquired {
+                    info!("inhibitor acquired");
+                }
+            }
+            Err(err) => error!(error = %err, "failed to create saver surface"),
         }
     }
 
@@ -638,9 +665,23 @@ impl HowanApp {
     /// - A compositor-issued close request goes through `dismiss` directly
     ///   (no phase logic — the compositor's "please close" is unconditional).
     pub(crate) fn dismiss(&mut self) {
-        if self.saver.take().is_some() {
+        if let Some(saver) = self.saver.take() {
             self.active_output = None;
             self.pending_rearm = Some(RearmIntent::Immediate);
+            // If the inhibitor is still held (i.e. dismiss happened *before*
+            // the Phase 3 timer fired), `Saver`'s `Drop` will destroy it;
+            // surface that as a structured release event with the dismiss
+            // reason. After a Phase 3 handoff the field is already `None`
+            // and the corresponding release was logged at that site with
+            // reason = "dpms_handoff", so we skip the log here.
+            let elapsed_since_shown = Instant::now().saturating_duration_since(saver.shown_at);
+            info!(
+                elapsed_since_shown_ms = elapsed_since_shown.as_millis() as u64,
+                "saver dismissed"
+            );
+            if saver.inhibitor.is_some() {
+                info!(reason = "dismiss", "inhibitor released");
+            }
         }
     }
 
@@ -673,7 +714,15 @@ impl HowanApp {
             // surface; matching `dismiss`'s idempotence, this is a no-op.
             return;
         };
-        match saver.phase(Instant::now(), self.t_grace, self.t_dpms) {
+        let now = Instant::now();
+        let phase = saver.phase(now, self.t_grace, self.t_dpms);
+        let elapsed_since_shown = now.saturating_duration_since(saver.shown_at);
+        info!(
+            phase = ?phase,
+            elapsed_since_shown_ms = elapsed_since_shown.as_millis() as u64,
+            "input received"
+        );
+        match phase {
             SaverPhase::Phase1 => self.dismiss(),
             SaverPhase::Phase2 => {
                 self.lock_session();
@@ -709,6 +758,8 @@ impl HowanApp {
     /// path is left alone.
     pub(crate) fn dpms_handoff(&mut self) {
         if let Some(saver) = self.saver.as_mut() {
+            let elapsed_since_shown = Instant::now().saturating_duration_since(saver.shown_at);
+            let inhibitor_was_held = saver.inhibitor.is_some();
             if let Some(inhibitor) = saver.inhibitor.take() {
                 inhibitor.destroy();
             }
@@ -726,6 +777,14 @@ impl HowanApp {
                 pointer.set_cursor(serial, None, 0, 0);
             }
             self.pending_rearm = Some(RearmIntent::AfterActive);
+            info!(
+                elapsed_since_shown_ms = elapsed_since_shown.as_millis() as u64,
+                "phase transition 2->3"
+            );
+            if inhibitor_was_held {
+                info!(reason = "dpms_handoff", "inhibitor released");
+            }
+            info!("dpms handoff: saver surface retained");
         }
     }
 
@@ -735,13 +794,15 @@ impl HowanApp {
     /// regardless. Tested via the injected
     /// [`SessionLocker`](lock::SessionLocker) (see `FailingLocker`).
     fn lock_session(&self) {
-        if let Err(err) = self.locker.lock() {
-            eprintln!("howan: lock-session failed: {err}");
+        match self.locker.lock() {
+            Ok(()) => info!("lock-session issued"),
+            Err(err) => warn!(error = %err, "lock-session failed"),
         }
     }
 
     /// Request termination of the whole process (set by the signal handler).
     fn request_exit(&mut self) {
+        info!("signal received; daemon shutting down");
         self.exit = true;
     }
 
@@ -1053,8 +1114,9 @@ mod tests {
         fn phase2_input(&mut self) {
             // This mirrors `HowanApp::on_input`'s Phase 2 arm verbatim:
             // call the locker, log on error, then dismiss unconditionally.
-            if let Err(err) = self.locker.lock() {
-                eprintln!("howan: lock-session failed: {err}");
+            match self.locker.lock() {
+                Ok(()) => tracing::info!("lock-session issued"),
+                Err(err) => tracing::warn!(error = %err, "lock-session failed"),
             }
             self.dismissed = true;
         }
