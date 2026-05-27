@@ -130,12 +130,10 @@ config-file driven tuning is M11.
 
 ### Manual / on-hardware (verified by a human before merge)
 
-- [ ] **Install + enable works end-to-end.** Run the four-step procedure
-      from the README on a fresh GNOME session: `cargo install --path
-      crates/howan`, copy the unit, `daemon-reload`, `enable --now`.
-      Confirm `systemctl --user status howan.service` reports `active
-      (running)`, and `journalctl --user -u howan.service` shows the
-      daemon's startup line.
+- [ ] **Install + enable works end-to-end.** Run `make install` from
+      the repo root on a fresh GNOME session. Confirm `systemctl --user
+      status howan.service` reports `active (running)`, and `journalctl
+      --user -u howan.service` shows the daemon's startup line.
 - [ ] **Idle cycle works under the service.** With the service running,
       idle the seat past `T1` (default 5 min, or temporarily edit the unit
       to `--idle-timeout 30` for a faster check) and confirm the saver
