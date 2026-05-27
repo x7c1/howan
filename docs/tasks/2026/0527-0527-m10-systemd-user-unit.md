@@ -130,41 +130,41 @@ config-file driven tuning is M11.
 
 ### Manual / on-hardware (verified by a human before merge)
 
-- [ ] **Install + enable works end-to-end.** Run `make install` from
+- [x] **Install + enable works end-to-end.** Run `make install` from
       the repo root on a fresh GNOME session. Confirm `systemctl --user
       status howan.service` reports `active (running)`, and `journalctl
       --user -u howan.service` shows the daemon's startup line.
-- [ ] **Idle cycle works under the service.** With the service running,
+- [x] **Idle cycle works under the service.** With the service running,
       idle the seat past `T1` (default 5 min, or temporarily edit the unit
       to `--idle-timeout 30` for a faster check) and confirm the saver
       appears, dismiss it with input, leave it idle again, saver
       reappears. Same behavior as foreground `howan daemon`.
-- [ ] **Restart on failure works.** While the service is running, kill
+- [x] **Restart on failure works.** While the service is running, kill
       the daemon process (`pkill -KILL howan`); within `RestartSec`
       systemd should bring it back. Confirm via `journalctl --user -u
       howan.service` and a follow-up `status` call.
 - [ ] **Survives a logout / login cycle.** Log out of the GNOME session
       and log back in. The service should already be active without any
       manual intervention.
-- [ ] **Daemon startup line records the effective thresholds.**
+- [x] **Daemon startup line records the effective thresholds.**
       `journalctl --user -u howan.service --since today` shows the
       `daemon starting` event with `backend=mutter`, `t1_secs`,
       `t_grace_secs`, and `t_dpms_secs` fields matching the configured
       values (or the built-in defaults when the unit is unmodified).
-- [ ] **Phase 1 dismiss cycle is visible in the journal.** A full cycle
+- [x] **Phase 1 dismiss cycle is visible in the journal.** A full cycle
       appears in order: `idle watch armed` -> `idle detected` -> `saver
       shown` -> `input received phase=Phase1` -> `saver dismissed` ->
       `inhibitor released reason=dismiss` -> `idle watch armed
       trigger=dismiss`. Verifiable by idling past `T1` and producing
       input within `T_grace`.
-- [ ] **Phase 2 cycle is visible in the journal.** With the saver up
+- [x] **Phase 2 cycle is visible in the journal.** With the saver up
       past `T_grace` but before `T_dpms`, input produces `input received
       phase=Phase2` followed by `lock-session issued, waiting for
       LockedHint`, then `locked hint observed elapsed_ms=...` (or
       `lock-session failed reason=...` and the saver still dismisses,
       per the log + proceed contract) and then the same dismiss /
       re-arm tail as Phase 1.
-- [ ] **Phase 2 LockedHint wait is observed in the journal.** Drive a
+- [x] **Phase 2 LockedHint wait is observed in the journal.** Drive a
       Phase 2 input on a real GNOME session and confirm
       `journalctl --user -u howan.service` shows
       `lock-session issued, waiting for LockedHint` followed by
@@ -202,12 +202,12 @@ config-file driven tuning is M11.
       trigger=add_user_active_watch`. The
       `trigger=add_user_active_watch` field is what distinguishes the
       Q4-gated re-arm from the M3 immediate re-arm.
-- [ ] **`make install` prints a GNOME compatibility check result.**
+- [x] **`make install` prints a GNOME compatibility check result.**
       The final line of `make install` is either
       `[howan] GNOME compatibility check: idle-delay=<N>s, T1=<M>s, ok`
       (configuration is fine), one of the WARNING blocks documented
       below, or an informational `... check skipped ...` line.
-- [ ] **`make install` warns when `gsettings idle-delay <= T1`.** Set
+- [x] **`make install` warns when `gsettings idle-delay <= T1`.** Set
       `gsettings set org.gnome.desktop.session idle-delay 'uint32 300'`
       with the daemon's default `T1=300`, run `make install`, and
       confirm stderr contains a `[howan] WARNING:` block that
@@ -217,7 +217,7 @@ config-file driven tuning is M11.
       command with the recommended value, and (c) points to
       [`docs/guides/40-resident-daemon.md`](../../guides/40-resident-daemon.md).
       The install must still succeed (exit 0).
-- [ ] **`make install` warns when `gsettings idle-delay == 0`.** Set
+- [x] **`make install` warns when `gsettings idle-delay == 0`.** Set
       `gsettings set org.gnome.desktop.session idle-delay 'uint32 0'`,
       run `make install`, and confirm stderr contains a `[howan]
       WARNING:` block that calls out that the compositor idle timer is
