@@ -78,9 +78,9 @@ pub trait IdleSource {
     /// Re-arm the watch immediately after the saver was dismissed by input, so
     /// the next idle period produces another [`IdleEvent::Idle`].
     ///
-    /// This is the right primitive for the Phase 1 / Phase 2 input-dismiss
-    /// path: the user just produced input, so they are by definition active
-    /// and the next idle period begins from "now". Some backends re-fire
+    /// This is the right primitive for the Phase 1 input-dismiss path: the
+    /// user just produced input, so they are by definition active and the
+    /// next idle period begins from "now". Some backends re-fire
     /// automatically and only need this as a no-op; others must re-add a
     /// watch. The contract is: after `rearm`, a subsequent idle period
     /// reliably yields another event. See each backend for specifics.

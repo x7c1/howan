@@ -27,8 +27,8 @@
 //!
 //! 1. Add an idle watch for `T1`; when it fires, emit [`IdleEvent::Idle`].
 //! 2. Block until the daemon sends a [`RearmKind`] through the rearm channel:
-//!    - [`RearmKind::Immediate`] — Phase 1 / Phase 2 input dismiss. The user
-//!      just produced input, so add a fresh `AddIdleWatch` right away.
+//!    - [`RearmKind::Immediate`] — Phase 1 input dismiss. The user just
+//!      produced input, so add a fresh `AddIdleWatch` right away.
 //!    - [`RearmKind::AfterActive`] — Phase 3 DPMS handoff. The user is still
 //!      idle (the timer fired *without* any input), so first add an
 //!      `AddUserActiveWatch`, wait for it to fire on the next genuine
@@ -51,7 +51,7 @@
 //! does not apply on the post-Phase-3 path: by the time `RearmKind::AfterActive`
 //! reaches the watch loop, Phase 3 has already destroyed the `Saver` and
 //! released the inhibitor, so the active watch sees unmasked state and fires
-//! on real user activity. The Phase 1 / Phase 2 input path still uses
+//! on real user activity. The Phase 1 input path still uses
 //! `RearmKind::Immediate` for a different reason: the user is active by
 //! definition there, and waiting for an active transition that has effectively
 //! already happened would deadlock the next idle cycle.
@@ -255,7 +255,7 @@ fn run_watch_loop(
     let mut pending_watch: Option<u32> = None;
 
     // Which trigger armed the *current* idle watch — `initial` on the very
-    // first arming, `dismiss` after a Phase 1 / Phase 2 input dismiss, and
+    // first arming, `dismiss` after a Phase 1 input dismiss, and
     // `add_user_active_watch` after a Phase 3 DPMS handoff (the active-watch
     // gate fired). Recorded only as a structured field on the `idle watch
     // armed` info event so the journal makes the re-arm path distinguishable
@@ -294,7 +294,7 @@ fn run_watch_loop(
         }
 
         // Step 2: block until the daemon re-arms us. It calls `rearm` after a
-        // saver-Phase 1 / Phase 2 input dismiss (immediate re-arm) or
+        // saver-Phase 1 input dismiss (immediate re-arm) or
         // `rearm_after_active` after a saver-Phase 3 DPMS handoff (gated on
         // the next user-active transition).
         let kind = match rearm_rx.recv() {
