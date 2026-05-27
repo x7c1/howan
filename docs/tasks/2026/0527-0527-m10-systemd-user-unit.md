@@ -146,6 +146,32 @@ config-file driven tuning is M11.
 - [ ] **Survives a logout / login cycle.** Log out of the GNOME session
       and log back in. The service should already be active without any
       manual intervention.
+- [ ] **Daemon startup line records the effective thresholds.**
+      `journalctl --user -u howan.service --since today` shows the
+      `daemon starting` event with `backend=mutter`, `t1_secs`,
+      `t_grace_secs`, and `t_dpms_secs` fields matching the configured
+      values (or the built-in defaults when the unit is unmodified).
+- [ ] **Phase 1 dismiss cycle is visible in the journal.** A full cycle
+      appears in order: `idle watch armed` -> `idle detected` -> `saver
+      shown` -> `input received phase=Phase1` -> `saver dismissed` ->
+      `inhibitor released reason=dismiss` -> `idle watch armed
+      trigger=dismiss`. Verifiable by idling past `T1` and producing
+      input within `T_grace`.
+- [ ] **Phase 2 cycle is visible in the journal.** With the saver up
+      past `T_grace` but before `T_dpms`, input produces `input received
+      phase=Phase2` followed by `lock-session issued` (or
+      `lock-session failed reason=...` and the saver still dismisses,
+      per the log + proceed contract) and then the same dismiss /
+      re-arm tail as Phase 1.
+- [ ] **Phase 3 cycle is visible in the journal.** Leaving the saver
+      idle past `T_dpms` produces `phase transition 2->3` followed by
+      `inhibitor released reason=dpms_handoff` and `dpms handoff:
+      saver surface retained`. After the next real user activity the
+      journal shows `user-active watch fired` -> `input received
+      phase=Phase3` -> `saver dismissed` -> `idle watch armed
+      trigger=add_user_active_watch`. The
+      `trigger=add_user_active_watch` field is what distinguishes the
+      Q4-gated re-arm from the M3 immediate re-arm.
 
 ## Out of scope
 
