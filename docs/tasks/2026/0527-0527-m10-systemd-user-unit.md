@@ -10,7 +10,7 @@ check_command: "cargo build && cargo test && cargo clippy --all-targets -- -D wa
 assignee: null
 branch: task/0527-0527-m10-systemd-user-unit
 created_at: 2026-05-27T05:27:28Z
-updated_at: 2026-05-27T06:17:04Z
+updated_at: 2026-05-27T10:09:32Z
 ---
 
 # feat(packaging): systemd `--user` unit for howan daemon (cargo install-based)
@@ -172,6 +172,33 @@ config-file driven tuning is M11.
       trigger=add_user_active_watch`. The
       `trigger=add_user_active_watch` field is what distinguishes the
       Q4-gated re-arm from the M3 immediate re-arm.
+- [ ] **`make install` prints a GNOME compatibility check result.**
+      The final line of `make install` is either
+      `[howan] GNOME compatibility check: idle-delay=<N>s, T1=<M>s, ok`
+      (configuration is fine), one of the WARNING blocks documented
+      below, or an informational `... check skipped ...` line.
+- [ ] **`make install` warns when `gsettings idle-delay <= T1`.** Set
+      `gsettings set org.gnome.desktop.session idle-delay 'uint32 300'`
+      with the daemon's default `T1=300`, run `make install`, and
+      confirm stderr contains a `[howan] WARNING:` block that
+      (a) names the race between Mutter's blank and howan's
+      `AddIdleWatch`, (b) prints a concrete
+      `gsettings set org.gnome.desktop.session idle-delay 'uint32 360'`
+      command with the recommended value, and (c) points to
+      [`docs/guides/40-resident-daemon.md`](../../guides/40-resident-daemon.md).
+      The install must still succeed (exit 0).
+- [ ] **`make install` warns when `gsettings idle-delay == 0`.** Set
+      `gsettings set org.gnome.desktop.session idle-delay 'uint32 0'`,
+      run `make install`, and confirm stderr contains a `[howan]
+      WARNING:` block that calls out that the compositor idle timer is
+      disabled so Phase 3 DPMS handoff will not blank the screen, and
+      recommends a concrete `gsettings set ... 'uint32 <T1+60>'`
+      command. Install still succeeds.
+- [ ] **`make install` skips the check silently when `gsettings` is
+      unavailable.** On a system without `gsettings` (or with the GNOME
+      schema absent), the check prints a single informational line
+      mentioning that it was skipped — **no** `WARNING:` lines — and
+      the install completes normally.
 
 ## Out of scope
 

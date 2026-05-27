@@ -42,12 +42,69 @@ Key points:
   journal. See [Verifying the daemon via the
   journal](#verifying-the-daemon-via-the-journal) for the commands and
   worked examples.
+- The GNOME compositor's `org.gnome.desktop.session idle-delay` must be
+  strictly greater than `T1` (and non-zero) — otherwise Mutter races
+  howan at saver-show time or breaks Phase 3 DPMS handoff. `make install`
+  warns on misconfiguration; see [GNOME compositor compatibility:
+  `idle-delay` vs `T1`](#gnome-compositor-compatibility-idle-delay-vs-t1).
 
 The composited-surface invariants the saver relies on (no `set_fullscreen`, no
 opaque region — the Blackwell safety rationale) are **not** repeated here; see
 [30-composited-surface.md](30-composited-surface.md). The daemon recreates the
 saver the same safe way on every idle cycle, at the single construction site in
 `crates/howan/src/app.rs` (`Saver::new`).
+
+## GNOME compositor compatibility: `idle-delay` vs `T1`
+
+howan and the GNOME compositor (Mutter) run two independent idle timers
+against the same seat: howan's `--idle-timeout` (`T1`, default 300s) drives
+the saver, and `org.gnome.desktop.session idle-delay` drives Mutter's own
+idle blank (DPMS off). These two timers **must not collide**, and the
+relationship between them affects two different phases of the lifecycle.
+
+The required configuration is:
+
+```
+org.gnome.desktop.session idle-delay  >=  T1 + 60s
+                                          and  != 0
+```
+
+`make install` runs a post-install compatibility check
+([`packaging/install.sh`](../../packaging/install.sh)) that reads `T1`
+from the installed unit and `idle-delay` via `gsettings`, then warns to
+stderr when the configuration matches one of the failure cases below. It
+does **not** auto-apply changes — fixing the setting is left to the user.
+The check is skipped silently on non-GNOME setups (no `gsettings` binary
+or schema). The same check is not (yet) repeated at daemon startup; that
+is a planned follow-up.
+
+### `idle-delay <= T1` races at saver-show time
+
+If `idle-delay` is less than or equal to `T1`, Mutter's blank timer fires
+at — or before — howan's idle watch. `zwp_idle_inhibit_unstable_v1` only
+prevents *future* idle blanks, not the one already in flight; by the time
+howan reacts to `WatchFired` and creates the saver surface plus its
+inhibitor, Mutter has already started the fade-to-blank. In practice
+Mutter wins the race, the saver flashes (or never appears) and the
+display goes to DPMS off instead. The equality case (`idle-delay == T1`)
+is just as bad as `<` for this reason.
+
+Fix: `gsettings set org.gnome.desktop.session idle-delay 'uint32 <T1 +
+60>'` (e.g. `uint32 360` for the default `T1=300`).
+
+### `idle-delay == 0` breaks Phase 3
+
+`idle-delay = 0` disables Mutter's idle timer entirely. The saver still
+shows correctly — howan owns its own idle detection through
+`org.gnome.Mutter.IdleMonitor` — but Phase 3 ([DPMS
+handoff](#phase-lifecycle)) stops working: when `dpms_handoff` releases
+the idle inhibitor at `T_dpms`, there is no compositor idle timer left to
+take over and blank the screen. The saver surface stays mapped and the
+backlight stays on forever (until input arrives), which defeats the whole
+point of the handoff.
+
+Fix: same as above — set `idle-delay` to a value larger than `T1` (and
+non-zero).
 
 ## Why idle detection is built in (not swayidle)
 
