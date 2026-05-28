@@ -182,11 +182,30 @@ real NVIDIA path under the SSH guard), then record:
 - Any `nvidia-modeset` / `GSP` errors in the captured kernel log (there must be
   none, as in the M-series composited-surface run).
 
-**Status: OUTSTANDING — this is the gate for M6.** The SSH-guarded Blackwell run
-has not been performed in this change. Do not treat M6 as fully verified until it
-is done and recorded here. The composited path is expected to keep the GPU
-rendering safe (the surface stays an ordinary composited window, never a scanout
-candidate), but that remains a hypothesis for the GPU-rendering path until this
-run confirms it.
+**Status: PASSED — Blackwell sign-off complete (2026-05-28).** Verified on an
+NVIDIA GeForce RTX 5060 Ti (Blackwell) + GNOME/Mutter session, under SSH guard
+from a second device. The selected adapter was logged as `device_type:
+DiscreteGpu, backend: Vulkan, NVIDIA` (the real GPU, not a software fallback).
+
+- `howan start`: the animated shader rendered full-screen and dismissed on
+  input, with no display-engine wedge and no `nvidia-modeset` / GSP crash.
+- `howan daemon --idle-timeout 10`: five idle -> show -> input-dismiss -> re-arm
+  cycles ran back to back; the animation re-rendered on every cycle (the
+  per-surface wgpu objects are rebuilt each idle cycle) with no errors, and
+  `SIGTERM` shut the daemon down cleanly (logged `daemon shutting down`, exit 0).
+- Two defects surfaced only on the real display and were fixed in this change:
+  the device requested the downlevel limits preset (2048 max texture dimension),
+  too small for the 5120x2160 output, so it now adopts the adapter's own limits;
+  and the `wl_surface.frame` callback was requested after `present()` (after the
+  commit), so the loop stalled after a single frame — it is now requested before
+  `present()`.
+
+Not yet exercised on hardware: the `DpmsHandoff` transition at `T_dpms` (it
+reuses the M3/M4 inhibitor + handoff logic plus the M6 surface retention).
+Verify when convenient; it is independent of the GPU-rendering path proven above.
+
+(The dev binary was built with a non-FHS toolchain, so the run set
+`LD_LIBRARY_PATH` + `VK_ICD_FILENAMES` to reach the system Vulkan loader and
+NVIDIA ICD. That is a build-environment detail, not part of the saver.)
 
 [wgpu]: https://wgpu.rs/
