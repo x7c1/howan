@@ -78,7 +78,7 @@ pub trait IdleSource {
     /// Re-arm the watch immediately after the saver was dismissed by input, so
     /// the next idle period produces another [`IdleEvent::Idle`].
     ///
-    /// This is the right primitive for the Phase 1 input-dismiss path: the
+    /// This is the right primitive for the `Inhibiting` input-dismiss path: the
     /// user just produced input, so they are by definition active and the
     /// next idle period begins from "now". Some backends re-fire
     /// automatically and only need this as a no-op; others must re-add a
@@ -89,7 +89,7 @@ pub trait IdleSource {
     /// Re-arm the watch only **after** the seat has been observed active
     /// again, so the next idle period produces another [`IdleEvent::Idle`].
     ///
-    /// This is the Phase 3 post-DPMS-handoff primitive: the daemon dropped
+    /// This is the post-DpmsHandoff primitive: the daemon dropped
     /// the saver (and its idle inhibitor) because `T_dpms` elapsed *without*
     /// any input, so the user is still idle and arming a fresh idle watch
     /// immediately would race the compositor's own idle blank — the howan
@@ -185,7 +185,7 @@ mod tests {
         assert_eq!(rearm_after_active_calls.load(Ordering::SeqCst), 0);
     }
 
-    /// Input-dismiss path calls `rearm` (immediate); Phase 3 DPMS-handoff path
+    /// Input-dismiss path calls `rearm` (immediate); DpmsHandoff path
     /// calls `rearm_after_active`. The two intents land on distinct trait
     /// methods so backends can implement different semantics (immediate vs.
     /// "wait for the seat to be active again first").

@@ -21,7 +21,7 @@ use clap::{Parser, Subcommand};
 
 use crate::daemon::DEFAULT_T1;
 
-/// Default `T_dpms` (Phase 1 → Phase 3 boundary) in seconds: 2 hours.
+/// Default `T_dpms` (`Inhibiting` → `DpmsHandoff` boundary) in seconds: 2 hours.
 /// After the saver has been shown this long, the daemon releases the idle
 /// inhibitor while keeping the saver surface mapped, so the compositor's
 /// standard idle blank takes over behind the saver. See
@@ -61,8 +61,8 @@ pub struct DaemonArgs {
 
     /// How long the saver may stay up before the daemon releases the idle
     /// inhibitor (while keeping the saver surface mapped) to let the
-    /// compositor's standard idle blank take over (Phase 3), in seconds (the
-    /// design's `T_dpms`, measured from the moment the saver is shown).
+    /// compositor's standard idle blank take over (the DpmsHandoff state), in
+    /// seconds (the design's `T_dpms`, measured from the moment the saver is shown).
     /// Defaults to 7200 (2 hours). Must be greater than zero.
     #[arg(long = "dpms-timeout", value_name = "SECONDS")]
     dpms_timeout_secs: Option<u64>,
@@ -86,8 +86,8 @@ impl DaemonArgs {
     }
 
     /// Reject a degenerate `T_dpms` of zero: it would fire the handoff timer
-    /// at saver-show, collapsing Phase 1 to nothing. Called from `main`
-    /// before the daemon starts.
+    /// at saver-show, collapsing the `Inhibiting` state to nothing. Called from
+    /// `main` before the daemon starts.
     pub fn validate(&self) -> Result<(), String> {
         let dpms = self.dpms_timeout();
         if dpms.is_zero() {

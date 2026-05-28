@@ -15,7 +15,7 @@
 //!   surface, shows the saver when the idle source fires, dispatches input by
 //!   the elapsed-time two-phase lifecycle (see [`SaverPhase`] and
 //!   `docs/guides/40-resident-daemon.md`), and on dismiss drops the *surface*
-//!   (not the process), re-arming for the next idle cycle. The Phase 3 timer
+//!   (not the process), re-arming for the next idle cycle. The DpmsHandoff timer
 //!   releases the idle inhibitor (so the compositor can blank the display)
 //!   but leaves the surface up, so the desktop is never exposed behind the
 //!   saver during the compositor's blank-countdown window.
@@ -137,7 +137,8 @@ pub fn run() -> Result<(), Box<dyn Error>> {
     insert_signal_source(&loop_handle)?;
 
     // The one-shot `start` path exits on the first input, so it never reaches
-    // Phase 3 in practice. A `T_dpms` large enough never to fire is sufficient.
+    // the DpmsHandoff state in practice. A `T_dpms` large enough never to fire
+    // is sufficient.
     let mut app = HowanApp::new(&globals, &qh, Duration::from_secs(u64::MAX / 2))?;
     // One-shot: show the saver immediately, then exit the process on dismiss.
     app.show_saver(&qh);
@@ -158,7 +159,7 @@ pub fn run() -> Result<(), Box<dyn Error>> {
 ///
 /// Connects to Wayland but shows **no** surface until the idle source reports
 /// that the seat has been idle for `T1`. Input tears down the saver surface,
-/// the Phase 3 timer releases the idle inhibitor (leaving the surface mapped
+/// the DpmsHandoff timer releases the idle inhibitor (leaving the surface mapped
 /// so the desktop is not exposed when the compositor blanks the display), and
 /// either path drives the daemon to re-arm the idle source while staying
 /// resident for the next cycle. `SIGTERM`/`SIGINT` terminate the whole daemon
@@ -169,8 +170,8 @@ pub fn run() -> Result<(), Box<dyn Error>> {
 /// a new `IdleSource` implementation without touching this function.
 ///
 /// `t_dpms` comes from the daemon CLI flag and defines the boundary between
-/// Phase 1 (input dismisses) and Phase 3 (DPMS handoff) — see [`SaverPhase`]
-/// and `docs/guides/40-resident-daemon.md`.
+/// the `Inhibiting` state (input dismisses) and the `DpmsHandoff` state — see
+/// [`SaverPhase`] and `docs/guides/40-resident-daemon.md`.
 pub fn run_daemon(
     idle_source: Box<dyn IdleSource>,
     t_dpms: Duration,
@@ -219,7 +220,7 @@ pub fn run_daemon(
 
     let mut app = HowanApp::new(&globals, &qh, t_dpms)?;
 
-    // The Phase 3 timer source. We register/cancel a calloop Timer for
+    // The DpmsHandoff timer source. We register/cancel a calloop Timer for
     // `t_dpms` whenever the saver is shown / dismissed.
     let mut dpms_timer_token: Option<RegistrationToken> = None;
 
@@ -245,10 +246,10 @@ pub fn run_daemon(
         }
 
         // If the saver is gone but our timer is still registered, cancel it.
-        // The Phase 3 timer-fire path itself does **not** drop the saver
+        // The DpmsHandoff timer-fire path itself does **not** drop the saver
         // anymore (the surface is kept up to hide the desktop during the
         // compositor's blank window), so `saver.is_none()` here means an
-        // input dismiss has just happened. If the Phase 3 timer already
+        // input dismiss has just happened. If the DpmsHandoff timer already
         // fired, the calloop closure above returned `TimeoutAction::Drop`
         // and the source has already been removed — so
         // `loop_handle.remove(token)` below finds a stale handle. That is
@@ -260,7 +261,7 @@ pub fn run_daemon(
         }
 
         // Both re-arm paths set `pending_rearm`: input dismiss via
-        // `dismiss` (Immediate) and the Phase 3 timer via `dpms_handoff`
+        // `dismiss` (Immediate) and the DpmsHandoff timer via `dpms_handoff`
         // (AfterActive, with the surface intentionally still up). Route
         // the variant to the matching re-arm primitive — see
         // [`RearmIntent`] for what each variant means.
@@ -334,7 +335,7 @@ pub(crate) struct HowanApp {
     /// `wl_pointer.set_cursor` with a null cursor. The initial Enter (handled in
     /// `app/handlers.rs`) hides the cursor for the saver's lifetime, but Mutter
     /// re-evaluates seat state when the idle inhibitor is destroyed and renders
-    /// its default cursor on top of the still-mapped saver in the Phase 3
+    /// its default cursor on top of the still-mapped saver in the DpmsHandoff
     /// → DPMS-off window. Re-applying the null cursor with the cached serial at
     /// `dpms_handoff` keeps the saver visually clean through that window. `None`
     /// until the first Enter on the saver, in which case no re-apply is possible
@@ -346,22 +347,22 @@ pub(crate) struct HowanApp {
     /// surface entered ("active output only"); until a surface-enter event
     /// arrives we fall back to the first advertised output.
     pub(crate) active_output: Option<WlOutput>,
-    /// Phase 1 → Phase 3 boundary (`T_dpms` in the design): the daemon arms a
-    /// calloop timer for this duration when the saver is shown and on fire
-    /// releases the idle inhibitor (via [`HowanApp::dpms_handoff`]) so the
-    /// compositor's own idle blank can take over. The saver surface itself is
-    /// **kept mapped** through the compositor's blank window so the desktop is
-    /// not exposed behind it — see [`SaverPhase::Phase3`].
+    /// `Inhibiting` → `DpmsHandoff` boundary (`T_dpms` in the design): the
+    /// daemon arms a calloop timer for this duration when the saver is shown
+    /// and on fire releases the idle inhibitor (via [`HowanApp::dpms_handoff`])
+    /// so the compositor's own idle blank can take over. The saver surface
+    /// itself is **kept mapped** through the compositor's blank window so the
+    /// desktop is not exposed behind it — see [`SaverPhase::DpmsHandoff`].
     t_dpms: Duration,
     /// Set by the `SIGTERM`/`SIGINT` handler to terminate the whole process.
     /// Input dismiss does **not** set this — it only drops `saver`.
     exit: bool,
-    /// Set when the daemon loop should re-arm its idle source after a Phase
-    /// 1 / Phase 3 event. The variant records *which* path ran so `run_daemon`
-    /// can pick between the two re-arm primitives on
+    /// Set when the daemon loop should re-arm its idle source after an
+    /// `Inhibiting` / `DpmsHandoff` event. The variant records *which* path ran
+    /// so `run_daemon` can pick between the two re-arm primitives on
     /// [`IdleSource`](crate::daemon::IdleSource): [`dismiss`] sets
     /// `Immediate` (input tore down the surface), and [`dpms_handoff`] sets
-    /// `AfterActive` (the Phase 3 timer destroyed the inhibitor while
+    /// `AfterActive` (the DpmsHandoff timer destroyed the inhibitor while
     /// keeping the surface mapped). Cleared by [`take_pending_rearm`].
     ///
     /// [`dismiss`]: HowanApp::dismiss
@@ -375,10 +376,10 @@ pub(crate) struct HowanApp {
 /// loop does not have to re-derive the phase that ran.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub(crate) enum RearmIntent {
-    /// Phase 1 input dismiss: the user produced input, arm a fresh idle watch
-    /// immediately.
+    /// `Inhibiting` input dismiss: the user produced input, arm a fresh idle
+    /// watch immediately.
     Immediate,
-    /// Phase 3 DPMS handoff: the handoff destroyed the idle inhibitor
+    /// `DpmsHandoff`: the handoff destroyed the idle inhibitor
     /// without any input (the saver surface stays mapped — see
     /// [`HowanApp::dpms_handoff`]), so the next idle watch must be gated on
     /// a user-active transition (see Q4 in the howan plan).
@@ -389,16 +390,18 @@ pub(crate) enum RearmIntent {
 /// shown. See [`Saver::phase`] and `docs/guides/40-resident-daemon.md`.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub(crate) enum SaverPhase {
-    /// Up to `T_dpms` after the saver was shown: input dismisses the saver
-    /// outright.
-    Phase1,
+    /// Up to `T_dpms` after the saver was shown: the idle inhibitor is held
+    /// (the compositor's DPMS blank is suppressed) and the saver covers the
+    /// screen. Input dismisses the saver outright.
+    Inhibiting,
     /// `T_dpms` (inclusive) and onward: the daemon's calloop timer has
-    /// released the idle inhibitor (so the compositor's standard idle blank
-    /// takes over) while leaving the saver surface mapped — the desktop
-    /// stays hidden behind the saver through the compositor's blank window.
-    /// Input that wakes the display now lands on the saver, and this branch
-    /// is the normal path: it dismisses the surface like Phase 1 does.
-    Phase3,
+    /// released the idle inhibitor, handing off to the compositor's standard
+    /// DPMS blank, while leaving the saver surface mapped as a cover — the
+    /// desktop stays hidden behind the saver through the compositor's blank
+    /// window. Input that wakes the display now lands on the saver, and this
+    /// branch is the normal path: it dismisses the surface like `Inhibiting`
+    /// does.
+    DpmsHandoff,
 }
 
 /// The recreatable on-screen saver: an output-sized composited toplevel and the
@@ -421,8 +424,8 @@ pub(crate) struct Saver {
     /// [`HowanApp::dpms_handoff`] (at `T_dpms`) before the surface itself was
     /// dropped.
     ///
-    /// Released either by [`HowanApp::dpms_handoff`] (Phase 3 handoff, surface
-    /// stays mapped) or by [`Saver`]'s `Drop` (input dismiss, surface goes
+    /// Released either by [`HowanApp::dpms_handoff`] (the DpmsHandoff timer,
+    /// surface stays mapped) or by [`Saver`]'s `Drop` (input dismiss, surface goes
     /// away). Both sites explicitly send `zwp_idle_inhibitor_v1.destroy`.
     /// This **must** be explicit: `wayland-client` proxies do not send their
     /// destructor request when the Rust handle is dropped, so without it the
@@ -434,7 +437,7 @@ pub(crate) struct Saver {
     /// became visible for the current cycle. It is the single source of truth
     /// for the two-phase lifecycle: [`Saver::phase`] compares `now - shown_at`
     /// against `T_dpms` to decide whether input or the timer should take
-    /// the Phase 1 or Phase 3 branch.
+    /// the `Inhibiting` or `DpmsHandoff` branch.
     shown_at: Instant,
 }
 
@@ -442,8 +445,8 @@ impl HowanApp {
     /// Bind the durable Wayland globals. No surface is created here; call
     /// [`show_saver`](HowanApp::show_saver) to put the saver on screen.
     ///
-    /// `t_dpms` defines the Phase 1 → Phase 3 boundary — see [`SaverPhase`]
-    /// and `docs/guides/40-resident-daemon.md`.
+    /// `t_dpms` defines the `Inhibiting` → `DpmsHandoff` boundary — see
+    /// [`SaverPhase`] and `docs/guides/40-resident-daemon.md`.
     fn new(
         globals: &wayland_client::globals::GlobalList,
         qh: &QueueHandle<HowanApp>,
@@ -609,11 +612,11 @@ impl HowanApp {
     ///
     /// Higher-level entry points dispatch to this primitive by phase:
     ///
-    /// - Input goes through [`on_input`](HowanApp::on_input). The Phase 3 arm
-    ///   reaches `dismiss` after a prior [`dpms_handoff`](HowanApp::dpms_handoff)
+    /// - Input goes through [`on_input`](HowanApp::on_input). The DpmsHandoff
+    ///   arm reaches `dismiss` after a prior [`dpms_handoff`](HowanApp::dpms_handoff)
     ///   has already destroyed the inhibitor and left the surface mapped; the
     ///   `Immediate` set here overrides the `AfterActive` the handoff set.
-    /// - The Phase 3 calloop timer goes through
+    /// - The DpmsHandoff calloop timer goes through
     ///   [`dpms_handoff`](HowanApp::dpms_handoff), the *separate* "release
     ///   inhibitor + flag re-arm" primitive for the no-input path: it keeps
     ///   the `Saver` surface mapped (so the desktop is not exposed during the
@@ -626,9 +629,9 @@ impl HowanApp {
             self.active_output = None;
             self.pending_rearm = Some(RearmIntent::Immediate);
             // If the inhibitor is still held (i.e. dismiss happened *before*
-            // the Phase 3 timer fired), `Saver`'s `Drop` will destroy it;
+            // the DpmsHandoff timer fired), `Saver`'s `Drop` will destroy it;
             // surface that as a structured release event with the dismiss
-            // reason. After a Phase 3 handoff the field is already `None`
+            // reason. After a DpmsHandoff the field is already `None`
             // and the corresponding release was logged at that site with
             // reason = "dpms_handoff", so we skip the log here.
             let elapsed_since_shown = Instant::now().saturating_duration_since(saver.shown_at);
@@ -644,12 +647,12 @@ impl HowanApp {
 
     /// Dispatch on user input according to the current saver phase.
     ///
-    /// - Phase 1: drop the surface (the M3 behavior).
-    /// - Phase 3: the **normal** path for input after the Phase 3 DPMS
+    /// - `Inhibiting`: drop the surface (the M3 behavior).
+    /// - `DpmsHandoff`: the **normal** path for input after the DPMS
     ///   handoff. The handoff released the inhibitor but left the surface
     ///   mapped, so the compositor blanked the display behind the saver
     ///   (not the desktop). Input wakes the display to the saver, and this
-    ///   branch dismisses it like Phase 1 does, overriding the pending
+    ///   branch dismisses it like `Inhibiting` does, overriding the pending
     ///   `AfterActive` intent with `Immediate`. In the corner case where
     ///   input lands at the exact `T_dpms` boundary before the calloop
     ///   timer has dispatched, the inhibitor is still held — `Saver`'s
@@ -675,15 +678,15 @@ impl HowanApp {
             "input received"
         );
         match phase {
-            SaverPhase::Phase1 => self.dismiss(),
-            SaverPhase::Phase3 => self.dismiss(),
+            SaverPhase::Inhibiting => self.dismiss(),
+            SaverPhase::DpmsHandoff => self.dismiss(),
         }
     }
 
-    /// Phase 3 timer callback: release the inhibitor while keeping the saver
+    /// DpmsHandoff timer callback: release the inhibitor while keeping the saver
     /// surface mapped, so the compositor's standard idle blank can take over
     /// without exposing the desktop behind the saver. The next input then
-    /// routes through [`on_input`](HowanApp::on_input)'s Phase 3 branch, which
+    /// routes through [`on_input`](HowanApp::on_input)'s DpmsHandoff branch, which
     /// calls [`dismiss`](HowanApp::dismiss) to tear the surface down.
     ///
     /// Unlike [`dismiss`](HowanApp::dismiss), this runs without any user
@@ -693,7 +696,7 @@ impl HowanApp {
     /// [`IdleSource::rearm_after_active`](crate::daemon::IdleSource::rearm_after_active),
     /// which gates the next idle watch on a real user-active transition to
     /// avoid racing the compositor's own idle blank. See
-    /// `docs/guides/40-resident-daemon.md` (Post-Phase-3 handoff) and Q4 in
+    /// `docs/guides/40-resident-daemon.md` (the DpmsHandoff handoff) and Q4 in
     /// the howan plan.
     ///
     /// The inhibitor is destroyed via the same `zwp_idle_inhibitor_v1.destroy`
@@ -727,7 +730,7 @@ impl HowanApp {
             self.pending_rearm = Some(RearmIntent::AfterActive);
             info!(
                 elapsed_since_shown_ms = elapsed_since_shown.as_millis() as u64,
-                "phase transition 1->3"
+                "phase transition: Inhibiting -> DpmsHandoff"
             );
             if inhibitor_was_held {
                 info!(reason = "dpms_handoff", "inhibitor released");
@@ -843,15 +846,16 @@ impl Saver {
     ///
     /// The decision is pure: it compares `now - shown_at` against `t_dpms`.
     /// The boundary is inclusive on the lower side — exactly at `t_dpms` we
-    /// are already in Phase 3. This matches the timer semantics in
+    /// are already in `DpmsHandoff`. This matches the timer semantics in
     /// `run_daemon`, which arms `Timer::from_duration(t_dpms)`: when the
-    /// timer fires, the elapsed time is `t_dpms` and we must be in Phase 3.
+    /// timer fires, the elapsed time is `t_dpms` and we must be in
+    /// `DpmsHandoff`.
     pub(crate) fn phase(&self, now: Instant, t_dpms: Duration) -> SaverPhase {
         let elapsed = now.saturating_duration_since(self.shown_at);
         if elapsed >= t_dpms {
-            SaverPhase::Phase3
+            SaverPhase::DpmsHandoff
         } else {
-            SaverPhase::Phase1
+            SaverPhase::Inhibiting
         }
     }
 }
@@ -868,7 +872,7 @@ impl Drop for Saver {
     /// surface, releases the inhibitor in the protocol-correct order; the
     /// request is flushed on the daemon's next event-loop dispatch.
     ///
-    /// After a Phase 3 handoff the `inhibitor` field is already `None`
+    /// After a DpmsHandoff the `inhibitor` field is already `None`
     /// (`HowanApp::dpms_handoff` took it via `Option::take` and called
     /// `destroy` itself), so this becomes a no-op — exactly the same code
     /// path the absent-manager case takes.
@@ -933,52 +937,52 @@ mod tests {
     fn phase_of(shown_at: Instant, now: Instant, t_dpms: Duration) -> SaverPhase {
         let elapsed = now.saturating_duration_since(shown_at);
         if elapsed >= t_dpms {
-            SaverPhase::Phase3
+            SaverPhase::DpmsHandoff
         } else {
-            SaverPhase::Phase1
+            SaverPhase::Inhibiting
         }
     }
 
     #[test]
-    fn phase_well_below_t_dpms_is_phase1() {
+    fn phase_well_below_t_dpms_is_inhibiting() {
         let shown_at = Instant::now();
         let now = shown_at + Duration::from_secs(5);
         let t_dpms = Duration::from_secs(60);
-        assert_eq!(phase_of(shown_at, now, t_dpms), SaverPhase::Phase1);
+        assert_eq!(phase_of(shown_at, now, t_dpms), SaverPhase::Inhibiting);
     }
 
     /// A saver shown well above zero but below `T_dpms` is still in
-    /// Phase 1: only `T_dpms` matters and there is no intermediate
+    /// `Inhibiting`: only `T_dpms` matters and there is no intermediate
     /// boundary, so input dismisses outright regardless of how long the
     /// saver has been up — even an hour into the cycle.
     #[test]
-    fn phase_anywhere_below_t_dpms_is_phase1() {
+    fn phase_anywhere_below_t_dpms_is_inhibiting() {
         let shown_at = Instant::now();
         // 30 s on the test clock stands in for "the saver has been up a
-        // long time"; the result must still be Phase 1.
+        // long time"; the result must still be `Inhibiting`.
         let now = shown_at + Duration::from_secs(30);
         let t_dpms = Duration::from_secs(60);
-        assert_eq!(phase_of(shown_at, now, t_dpms), SaverPhase::Phase1);
+        assert_eq!(phase_of(shown_at, now, t_dpms), SaverPhase::Inhibiting);
     }
 
     #[test]
-    fn phase_at_exact_t_dpms_is_phase3() {
-        // Boundary at exactly T_dpms is Phase 3. This matches the calloop
+    fn phase_at_exact_t_dpms_is_dpms_handoff() {
+        // Boundary at exactly T_dpms is `DpmsHandoff`. This matches the calloop
         // timer semantics in `run_daemon`: when `Timer::from_duration(t_dpms)`
         // fires, `now - shown_at == t_dpms` and the callback must take the
-        // Phase 3 branch.
+        // `DpmsHandoff` branch.
         let shown_at = Instant::now();
         let t_dpms = Duration::from_secs(60);
         let now = shown_at + t_dpms;
-        assert_eq!(phase_of(shown_at, now, t_dpms), SaverPhase::Phase3);
+        assert_eq!(phase_of(shown_at, now, t_dpms), SaverPhase::DpmsHandoff);
     }
 
     #[test]
-    fn phase_past_t_dpms_is_phase3() {
+    fn phase_past_t_dpms_is_dpms_handoff() {
         let shown_at = Instant::now();
         let t_dpms = Duration::from_secs(60);
         let now = shown_at + Duration::from_secs(120);
-        assert_eq!(phase_of(shown_at, now, t_dpms), SaverPhase::Phase3);
+        assert_eq!(phase_of(shown_at, now, t_dpms), SaverPhase::DpmsHandoff);
     }
 
     /// `on_input` must be a no-op when `self.saver` is `None`. We can exercise
@@ -1012,10 +1016,10 @@ mod tests {
         );
     }
 
-    /// `dismiss` (input path) and `dpms_handoff` (Phase 3 path) must land on
+    /// `dismiss` (input path) and `dpms_handoff` (DpmsHandoff path) must land on
     /// *different* re-arm intents — `Immediate` for input, `AfterActive` for
-    /// Phase 3 — so `run_daemon` can route them to the matching `IdleSource`
-    /// primitive (Q4: avoid the post-Phase-3 race against the compositor's
+    /// DpmsHandoff — so `run_daemon` can route them to the matching `IdleSource`
+    /// primitive (Q4: avoid the post-DpmsHandoff race against the compositor's
     /// own idle blank).
     ///
     /// They also differ structurally: `dismiss` drops the whole `Saver`,
@@ -1067,7 +1071,7 @@ mod tests {
         assert_eq!(app.pending_rearm, Some(RearmIntent::Immediate));
         assert!(app.saver.is_none());
 
-        // Phase 3 handoff → re-arm gated on the next user-active transition,
+        // DpmsHandoff → re-arm gated on the next user-active transition,
         // surface still up, inhibitor gone.
         let mut app = StubApp {
             saver: Some(SaverStub {
@@ -1101,7 +1105,7 @@ mod tests {
     }
 
     /// After `dpms_handoff` runs, an input event arriving on the still-mapped
-    /// saver routes through the Phase 3 arm of `on_input`, which dismisses
+    /// saver routes through the DpmsHandoff arm of `on_input`, which dismisses
     /// the saver (drops the surface) and overrides the pending re-arm intent
     /// from `AfterActive` (set by the handoff) to `Immediate` (the user is
     /// back, so the next idle cycle starts cleanly).
@@ -1120,9 +1124,9 @@ mod tests {
             fn phase(&self, now: Instant, t_dpms: Duration) -> SaverPhase {
                 let elapsed = now.saturating_duration_since(self.shown_at);
                 if elapsed >= t_dpms {
-                    SaverPhase::Phase3
+                    SaverPhase::DpmsHandoff
                 } else {
-                    SaverPhase::Phase1
+                    SaverPhase::Inhibiting
                 }
             }
         }
@@ -1152,8 +1156,8 @@ mod tests {
                     return;
                 };
                 match saver.phase(now, self.t_dpms) {
-                    SaverPhase::Phase1 => self.dismiss(),
-                    SaverPhase::Phase3 => self.dismiss(),
+                    SaverPhase::Inhibiting => self.dismiss(),
+                    SaverPhase::DpmsHandoff => self.dismiss(),
                 }
             }
         }
@@ -1175,18 +1179,18 @@ mod tests {
         assert!(app.saver.as_ref().unwrap().inhibitor.is_none());
         assert_eq!(app.pending_rearm, Some(RearmIntent::AfterActive));
 
-        // Input at `shown_at + t_dpms` lands in the Phase 3 arm of
+        // Input at `shown_at + t_dpms` lands in the DpmsHandoff arm of
         // `on_input`. The arm dismisses → surface gone, Immediate
         // overrides AfterActive.
         app.on_input(shown_at + t_dpms);
         assert!(
             app.saver.is_none(),
-            "Phase 3 input must dismiss the surface"
+            "DpmsHandoff input must dismiss the surface"
         );
         assert_eq!(
             app.pending_rearm,
             Some(RearmIntent::Immediate),
-            "Phase 3 input must override the AfterActive intent with Immediate"
+            "DpmsHandoff input must override the AfterActive intent with Immediate"
         );
     }
 }

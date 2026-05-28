@@ -59,12 +59,19 @@ made the lock path itself the wrong abstraction to keep:
 
 - **R3 in the howan plan is revised** by Q-phase2-lock to remove
   Phase 2. After this PR, the lifecycle is:
-  - Phase 1 (immediate dismiss): from `T1` (saver shown) up to
-    `T_dpms`. Any input dismisses the saver and the daemon re-arms.
-  - Phase 3 (DPMS handoff): at `T_dpms`, howan releases its idle
-    inhibitor and retains the saver surface so the compositor's
-    fade-to-blank does not expose the desktop; the compositor then
-    DPMS-offs the outputs according to its own `idle-delay`.
+  - Phase 1 (immediate dismiss; `SaverPhase::Inhibiting` in code):
+    from `T1` (saver shown) up to `T_dpms`. Any input dismisses the
+    saver and the daemon re-arms.
+  - Phase 3 (DPMS handoff; `SaverPhase::DpmsHandoff` in code): at
+    `T_dpms`, howan releases its idle inhibitor and retains the saver
+    surface so the compositor's fade-to-blank does not expose the
+    desktop; the compositor then DPMS-offs the outputs according to
+    its own `idle-delay`.
+
+  The two surviving states are named after what they do (rather than
+  the old `Phase1`/`Phase3` numbering, which left a confusing gap
+  where Phase 2 was removed): `Inhibiting` holds the idle inhibitor,
+  `DpmsHandoff` has released it to the compositor.
 - **The `T_grace` boundary and the entire Phase 2 state disappear.**
   There is no longer any time-based phase transition until `T_dpms`.
 - **The `--grace-timeout` CLI flag is removed.** `--idle-timeout` and
@@ -191,7 +198,7 @@ Phase 2 / lock infrastructure is removed from `crates/howan/src/`.
 - [x] **Phase 3 still works.** Using a short-timer drop-in
       (`--idle-timeout 30 --dpms-timeout 90`), confirm the Phase 3
       journal trail: `idle detected` → `saver shown` → `phase
-      transition 1->3` (or whatever the new event is named) →
+      transition: Inhibiting -> DpmsHandoff` →
       `inhibitor released reason="dpms_handoff"` → `dpms handoff:
       saver surface retained` → user-active watch armed → input →
       `saver dismissed` → `idle watch armed
