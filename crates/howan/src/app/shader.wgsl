@@ -53,6 +53,17 @@ fn fs_main(@builtin(position) frag_coord: vec4<f32>) -> @location(0) vec4<f32> {
     let r = length(p) * 5.0;
     v += sin(r - t * 1.5);
 
-    let c = 0.5 + 0.5 * cos(vec3<f32>(0.0, 2.094, 4.188) + v * 1.2);
+    // Map the plasma field to a calm, low-brightness palette so the saver is
+    // easy on the eyes: a smooth drift between a deep blue base and a soft
+    // slate-teal, rather than a full-saturation rainbow. The motion still comes
+    // from the time terms in `v`; only the color mapping is muted.
+    let m = 0.5 + 0.5 * sin(v);
+    let low = vec3<f32>(0.03, 0.05, 0.09);
+    let high = vec3<f32>(0.16, 0.22, 0.30);
+    var c = mix(low, high, m);
+    // A gentle hue drift shows a little more color (blue <-> teal <-> violet)
+    // without turning the field loud; the amplitude is kept small on purpose.
+    c += 0.06 * cos(vec3<f32>(0.0, 2.094, 4.188) + v * 0.5 + t * 0.2);
+    c = max(c, vec3<f32>(0.0));
     return vec4<f32>(c, 1.0);
 }

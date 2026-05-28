@@ -116,17 +116,41 @@ impl Gpu {
     pub(crate) fn new() -> Result<Self, Box<dyn std::error::Error>> {
         let instance = wgpu::Instance::default();
         let adapter = pollster::block_on(instance.request_adapter(&wgpu::RequestAdapterOptions {
-            power_preference: wgpu::PowerPreference::default(),
+            // The saver covers a whole output; on a discrete-GPU machine that is
+            // the GPU we want (and the one the Blackwell composited-path design
+            // targets), so prefer it over an integrated adapter.
+            power_preference: wgpu::PowerPreference::HighPerformance,
             force_fallback_adapter: false,
             compatible_surface: None,
         }))
         .ok_or("no suitable wgpu adapter found")?;
 
+        // Record which adapter wgpu actually selected. This makes it obvious in
+        // the journal whether the saver runs on the real GPU (`device_type:
+        // DiscreteGpu`, e.g. an NVIDIA Vulkan adapter) or fell back to a
+        // software rasterizer (`device_type: Cpu`, e.g. llvmpipe/lavapipe) —
+        // the latter renders correctly but on the CPU, which is easy to mistake
+        // for "the GPU is idle".
+        let info = adapter.get_info();
+        tracing::info!(
+            name = %info.name,
+            backend = ?info.backend,
+            device_type = ?info.device_type,
+            driver = %info.driver,
+            "wgpu adapter selected"
+        );
+
         let (device, queue) = pollster::block_on(adapter.request_device(
             &wgpu::DeviceDescriptor {
                 label: Some("howan-device"),
                 required_features: wgpu::Features::empty(),
-                required_limits: wgpu::Limits::downlevel_defaults(),
+                // Adopt the adapter's real limits rather than a preset. The
+                // saver surface is sized to the output's current mode, which on
+                // a real display exceeds the downlevel preset's 2048 max texture
+                // dimension (e.g. a 5120x2160 monitor) and would fail
+                // `Surface::configure`. The adapter's own max is what the GPU can
+                // actually scan out, so it always covers the output size.
+                required_limits: adapter.limits(),
                 memory_hints: wgpu::MemoryHints::default(),
             },
             None,

@@ -579,17 +579,22 @@ impl HowanApp {
     /// attach + `wl_surface.commit` flow — the caller no longer commits the
     /// window itself.
     ///
-    /// After painting, a `wl_surface.frame` callback is requested (unless one is
-    /// already in flight) so [`HowanApp::on_frame`] is woken to paint the next
-    /// frame. The loop is compositor-paced (typically vsync), which caps the FPS
-    /// without a busy-loop. It stops naturally when the surface is dropped on
-    /// dismiss.
+    /// The next `wl_surface.frame` callback is requested *before* presenting
+    /// (unless one is already in flight), because wgpu's `present()` issues the
+    /// `wl_surface.commit` and a frame callback only takes effect on the commit
+    /// that follows its request. Requesting it after `render()` would leave it
+    /// in pending surface state that nothing commits, so [`HowanApp::on_frame`]
+    /// would never fire and the loop would stall after a single frame. With the
+    /// request in place first, the present commit carries it and wakes
+    /// `on_frame` to paint the next frame. The loop is compositor-paced
+    /// (typically vsync), which caps the FPS without a busy-loop; it stops
+    /// naturally when the surface is dropped on dismiss.
     pub(crate) fn draw(&mut self) {
         let qh = self.qh.clone();
         if let Some(saver) = self.saver.as_mut() {
             let elapsed = Instant::now().saturating_duration_since(saver.shown_at);
-            saver.renderer.render(elapsed);
             saver.request_frame_if_idle(&qh);
+            saver.renderer.render(elapsed);
         }
     }
 
