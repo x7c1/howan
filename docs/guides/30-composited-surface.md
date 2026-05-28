@@ -14,8 +14,8 @@ Key points:
 - howan does **not** call `xdg_toplevel.set_fullscreen`. It sizes an ordinary
   `xdg_toplevel` to the active output's current mode instead.
 - howan does **not** declare an opaque region on its surface
-  (`wl_surface.set_opaque_region`). The shm buffer is still filled with
-  opaque-black pixels, which is a different thing.
+  (`wl_surface.set_opaque_region`). The shader still outputs opaque pixels
+  (alpha 1.0), which is a different thing.
 - There is **no per-GPU / per-vendor branching**. The composited path is the
   single, unconditional drawing path for all hardware.
 - This is a **temporary workaround**, not the preferred design. The
@@ -69,8 +69,9 @@ the normal composited path and no risky modeset happens. howan therefore:
 These are two different things and only the second one matters for scanout
 eligibility:
 
-- The `wl_shm` ARGB8888 buffer is filled with fully opaque black
-  (alpha `0xFF`). This is purely about appearance (a solid black screen).
+- The GPU shader outputs fully opaque pixels (alpha `1.0`). This is purely
+  about appearance (what the saver looks like). See
+  [50-shader-player.md](50-shader-player.md).
 - `wl_surface.set_opaque_region` would tell the compositor the surface has no
   see-through parts, making it an unredirect/scanout candidate. howan never
   calls this.

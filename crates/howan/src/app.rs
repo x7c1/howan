@@ -1,11 +1,13 @@
 //! The composited Wayland saver surface and the state that drives it.
 //!
-//! `HowanApp` owns the durable Wayland state — the registry, seat, output,
-//! and the `wl_compositor` / `xdg_wm_base` / `wl_shm` globals — that persists
-//! for the whole lifetime of the process. The saver itself (an output-sized
-//! composited `xdg_toplevel` plus its `wl_shm` renderer) is split out into
+//! `HowanApp` owns the durable Wayland state — the registry, seat, output, and
+//! the `wl_compositor` / `xdg_wm_base` globals — plus the durable wgpu GPU state
+//! ([`Gpu`]) and the `wl_display` connection, all persisting for the whole
+//! lifetime of the process. The saver itself (an output-sized composited
+//! `xdg_toplevel` plus its per-surface GPU [`Renderer`]) is split out into
 //! [`Saver`] and held in `HowanApp::saver` as an `Option`, so it can be created
-//! on demand and dropped on dismiss **without** tearing down the connection.
+//! on demand and dropped on dismiss **without** tearing down the connection or
+//! the GPU device. See `docs/guides/50-shader-player.md`.
 //!
 //! Two entry points use this state:
 //!
@@ -37,19 +39,20 @@
 //! the saver on every idle cycle, [`Saver::new`] must recreate it the same safe
 //! way every time — the invariant lives at that one construction site.
 //!
-//! SCTK is used for the compositor / xdg-shell / shm / seat / pointer / touch
-//! glue, but `wl_keyboard` is bound directly through `wayland-client` so we
-//! can avoid pulling in libxkbcommon at build time. We only need to know that
-//! some key was pressed; full keymap interpretation is unnecessary.
+//! SCTK is used for the compositor / xdg-shell / seat / pointer / touch glue,
+//! but `wl_keyboard` is bound directly through `wayland-client` so we can avoid
+//! pulling in libxkbcommon at build time. We only need to know that some key was
+//! pressed; full keymap interpretation is unnecessary.
 //!
 //! The module is split into three files so the boundaries that future
 //! milestones will cross are explicit:
 //!
 //! - `app.rs` (this file) holds `run`, `run_daemon`, and the top-level
 //!   `HowanApp` / `Saver` state.
-//! - `app::render` owns surface drawing and the `wl_shm` buffer pool. A
-//!   later milestone is expected to swap this out for a GPU-backed
-//!   renderer; isolating it here means that change is local.
+//! - `app::render` owns the GPU-backed WGSL renderer: the durable wgpu device /
+//!   pipeline ([`Gpu`]) and the per-surface [`Renderer`] that animates the
+//!   bundled shader once per Wayland frame callback. Isolating it here kept the
+//!   earlier swap from the `wl_shm` renderer local.
 //! - `app::handlers` contains every Wayland-protocol handler trait impl
 //!   plus the `delegate_*!` macros.
 //!
@@ -67,6 +70,7 @@ mod handlers;
 mod render;
 
 use std::error::Error;
+use std::rc::Rc;
 use std::time::{Duration, Instant};
 
 use calloop::channel::{channel, Event as ChannelEvent};
@@ -87,7 +91,6 @@ use smithay_client_toolkit::{
         },
         WaylandSurface,
     },
-    shm::Shm,
 };
 use wayland_client::{
     globals::registry_queue_init,
@@ -101,13 +104,14 @@ use wayland_protocols::wp::idle_inhibit::zv1::client::{
     zwp_idle_inhibitor_v1::ZwpIdleInhibitorV1,
 };
 
-use self::render::Renderer;
+use self::render::{Gpu, Renderer};
 use crate::daemon::{IdleEvent, IdleSource};
 use crate::pidfile::PidFileGuard;
 
-/// Pre-configure starting size for the shm pool, never the intended final
-/// size. The window is resized to the active output's current mode dimensions
-/// as soon as the output geometry is known (see `resize_to_active_output`).
+/// Pre-configure starting size for the renderer's surface, never the intended
+/// final size. The window is resized to the active output's current mode
+/// dimensions as soon as the output geometry is known (see
+/// `resize_to_active_output`), which reconfigures the wgpu swapchain.
 const INITIAL_WIDTH: u32 = 1280;
 const INITIAL_HEIGHT: u32 = 720;
 
@@ -139,7 +143,7 @@ pub fn run() -> Result<(), Box<dyn Error>> {
     // The one-shot `start` path exits on the first input, so it never reaches
     // the DpmsHandoff state in practice. A `T_dpms` large enough never to fire
     // is sufficient.
-    let mut app = HowanApp::new(&globals, &qh, Duration::from_secs(u64::MAX / 2))?;
+    let mut app = HowanApp::new(&globals, &qh, conn.clone(), Duration::from_secs(u64::MAX / 2))?;
     // One-shot: show the saver immediately, then exit the process on dismiss.
     app.show_saver(&qh);
 
@@ -218,7 +222,7 @@ pub fn run_daemon(
     // error and a non-zero exit instead of a silent hang.
     let _idle_handle = idle_source.start(idle_tx)?;
 
-    let mut app = HowanApp::new(&globals, &qh, t_dpms)?;
+    let mut app = HowanApp::new(&globals, &qh, conn.clone(), t_dpms)?;
 
     // The DpmsHandoff timer source. We register/cancel a calloop Timer for
     // `t_dpms` whenever the saver is shown / dismissed.
@@ -315,7 +319,18 @@ pub(crate) struct HowanApp {
     pub(crate) output_state: OutputState,
     pub(crate) compositor: CompositorState,
     pub(crate) xdg_shell: XdgShell,
-    pub(crate) shm: Shm,
+    /// The durable, process-lifetime wgpu state (instance/adapter/device/queue,
+    /// the compiled shader pipeline, and the uniform buffer). Creating a wgpu
+    /// device is expensive, so it is built once and shared (behind an `Rc`) with
+    /// every per-cycle `Saver`'s `Renderer`, which only rebuilds the cheap
+    /// per-surface wgpu objects. See `app::render` and
+    /// `docs/guides/50-shader-player.md`.
+    gpu: Rc<Gpu>,
+    /// The Wayland connection, kept for the whole process. The GPU renderer
+    /// reads the raw `wl_display` pointer from its backend to create the wgpu
+    /// surface (see `Renderer::new`). Holding it here also keeps that pointer
+    /// valid for as long as any wgpu surface derived from it exists.
+    conn: Connection,
     /// A handle to the shared event queue, kept so idle-channel callbacks (which
     /// receive only `&mut HowanApp`) can create the saver surface on demand.
     qh: QueueHandle<HowanApp>,
@@ -405,11 +420,21 @@ pub(crate) enum SaverPhase {
 }
 
 /// The recreatable on-screen saver: an output-sized composited toplevel and the
-/// `wl_shm` renderer that paints it. Dropped on dismiss; recreated each idle
-/// cycle by [`HowanApp::show_saver`].
+/// GPU-backed WGSL renderer that paints it. Dropped on dismiss; recreated each
+/// idle cycle by [`HowanApp::show_saver`].
 pub(crate) struct Saver {
-    pub(crate) window: Window,
+    /// The wgpu renderer. Declared **before** `window` so it drops first: the
+    /// wgpu surface inside it wraps the raw `wl_surface` pointer owned by
+    /// `window`, and the surface must not outlive that pointer. Rust drops
+    /// struct fields in declaration order, so this ordering is load-bearing.
     pub(crate) renderer: Renderer,
+    pub(crate) window: Window,
+    /// Whether a `wl_surface.frame` callback is currently in flight. The
+    /// per-frame loop requests a callback only when none is pending, so layout
+    /// events (configure / output changes) that also paint do not stack
+    /// multiple callbacks and spin the loop faster than vsync. Set when a
+    /// callback is requested, cleared in [`HowanApp::on_frame`].
+    frame_pending: bool,
     /// Set once the xdg surface has received its first configure. We must not
     /// attach a buffer and commit before that (xdg-shell forbids committing a
     /// buffer to a surface that has never been configured); output/seat events
@@ -450,20 +475,24 @@ impl HowanApp {
     fn new(
         globals: &wayland_client::globals::GlobalList,
         qh: &QueueHandle<HowanApp>,
+        conn: Connection,
         t_dpms: Duration,
     ) -> Result<Self, Box<dyn Error>> {
         let compositor = CompositorState::bind(globals, qh)
             .map_err(|err| format!("wl_compositor not available: {err}"))?;
         let xdg_shell = XdgShell::bind(globals, qh)
             .map_err(|err| format!("xdg_wm_base not available: {err}"))?;
-        let shm =
-            Shm::bind(globals, qh).map_err(|err| format!("wl_shm not available: {err}"))?;
+
+        // Build the durable wgpu state once. This is the expensive
+        // adapter/device request plus shader-pipeline compilation; the
+        // per-cycle `Saver` reuses it and only rebuilds the per-surface objects.
+        let gpu = Rc::new(Gpu::new()?);
 
         // Bind the idle-inhibit manager through the existing GlobalList. This is
         // best-effort: a compositor without the global degrades to "no
         // inhibitor", and the saver still shows. We log once so the absence is
-        // diagnosable, then keep `None`. Unlike the compositor / xdg / shm
-        // globals above, a missing idle-inhibit manager is *not* fatal — DPMS
+        // diagnosable, then keep `None`. Unlike the compositor / xdg globals
+        // above, a missing idle-inhibit manager is *not* fatal — DPMS
         // suppression is an enhancement to the saver, not a precondition for it.
         let idle_inhibit_manager = match globals.bind::<ZwpIdleInhibitManagerV1, _, _>(qh, 1..=1, ())
         {
@@ -484,7 +513,8 @@ impl HowanApp {
             output_state: OutputState::new(globals, qh),
             compositor,
             xdg_shell,
-            shm,
+            gpu,
+            conn,
             qh: qh.clone(),
             idle_inhibit_manager,
             saver: None,
@@ -508,7 +538,8 @@ impl HowanApp {
         match Saver::new(
             &self.compositor,
             &self.xdg_shell,
-            &self.shm,
+            &self.gpu,
+            &self.conn,
             self.idle_inhibit_manager.as_ref(),
             qh,
         ) {
@@ -539,13 +570,50 @@ impl HowanApp {
         self.saver.as_ref().is_some_and(|s| s.configured)
     }
 
-    /// Paint the current surface contents and commit the window. No-op when no
-    /// saver is shown.
+    /// Render one animated frame of the shader and ensure the per-frame loop is
+    /// running. No-op when no saver is shown.
+    ///
+    /// `iTime` is derived from `now - shown_at`, so the shader animates from the
+    /// moment the saver became visible. wgpu's `present()` inside
+    /// `Renderer::render` commits the `wl_surface`, replacing the old `wl_shm`
+    /// attach + `wl_surface.commit` flow — the caller no longer commits the
+    /// window itself.
+    ///
+    /// The next `wl_surface.frame` callback is requested *before* presenting
+    /// (unless one is already in flight), because wgpu's `present()` issues the
+    /// `wl_surface.commit` and a frame callback only takes effect on the commit
+    /// that follows its request. Requesting it after `render()` would leave it
+    /// in pending surface state that nothing commits, so [`HowanApp::on_frame`]
+    /// would never fire and the loop would stall after a single frame. With the
+    /// request in place first, the present commit carries it and wakes
+    /// `on_frame` to paint the next frame. The loop is compositor-paced
+    /// (typically vsync), which caps the FPS without a busy-loop; it stops
+    /// naturally when the surface is dropped on dismiss.
     pub(crate) fn draw(&mut self) {
+        let qh = self.qh.clone();
         if let Some(saver) = self.saver.as_mut() {
-            saver.renderer.render(saver.window.wl_surface());
-            saver.window.commit();
+            let elapsed = Instant::now().saturating_duration_since(saver.shown_at);
+            saver.request_frame_if_idle(&qh);
+            saver.renderer.render(elapsed);
         }
+    }
+
+    /// Wayland frame-callback tick: advance and render the next animated frame.
+    ///
+    /// Driven by `CompositorHandler::frame` (see `app/handlers.rs`). Clears the
+    /// in-flight flag, then `draw` paints and re-requests the next callback,
+    /// keeping the loop going. A frame callback that arrives after the saver was
+    /// dismissed (raced teardown) finds no saver and is a no-op.
+    pub(crate) fn on_frame(&mut self, surface: &wayland_client::protocol::wl_surface::WlSurface) {
+        let Some(saver) = self.saver.as_mut() else {
+            return;
+        };
+        // Ignore callbacks for any surface other than the current saver's.
+        if surface != saver.window.wl_surface() {
+            return;
+        }
+        saver.frame_pending = false;
+        self.draw();
     }
 
     /// Resize the saver surface to cover the active output's current mode.
@@ -791,9 +859,12 @@ impl Saver {
     /// invariant — recreate the surface the same safe way each time. See
     /// `docs/guides/30-composited-surface.md` for the full rationale.
     ///
-    /// The shm buffer is still filled with opaque-black pixels (alpha 0xFF) for
-    /// appearance — that is a separate thing from declaring an opaque *region*
-    /// on the surface, and only the latter governs Mutter's scanout eligibility.
+    /// The wgpu renderer wraps this `wl_surface` to drive the GPU shader; that
+    /// wrapping (`Renderer::new`) takes no `set_fullscreen` step and declares no
+    /// opaque region — it only reads the raw `wl_display` / `wl_surface`
+    /// pointers. The shader outputs opaque pixels (alpha 1.0) for appearance,
+    /// which is a separate thing from declaring an opaque *region* on the
+    /// surface; only the latter governs Mutter's scanout eligibility.
     ///
     /// When `idle_inhibit_manager` is `Some`, an inhibitor is created against
     /// this saver's `wl_surface` and stored on the returned `Saver` (see the
@@ -804,7 +875,8 @@ impl Saver {
     fn new(
         compositor: &CompositorState,
         xdg_shell: &XdgShell,
-        shm: &Shm,
+        gpu: &Rc<Gpu>,
+        conn: &Connection,
         idle_inhibit_manager: Option<&ZwpIdleInhibitManagerV1>,
         qh: &QueueHandle<HowanApp>,
     ) -> Result<Self, Box<dyn Error>> {
@@ -823,7 +895,11 @@ impl Saver {
         // `HowanApp::resize_to_active_output`).
         window.commit();
 
-        let renderer = Renderer::new(shm, INITIAL_WIDTH, INITIAL_HEIGHT)?;
+        // Wrap the just-created `wl_surface` in a wgpu surface sharing the
+        // durable GPU/device. This only reads the raw `wl_display` /
+        // `wl_surface` pointers (see `Renderer::new`); it does not call
+        // `set_fullscreen` and does not declare an opaque region.
+        let renderer = Renderer::new(gpu, conn, window.wl_surface(), INITIAL_WIDTH, INITIAL_HEIGHT)?;
 
         // Hold an idle inhibitor against the saver surface so the compositor does
         // not blank the display behind it. When the manager is `None` (global
@@ -834,12 +910,31 @@ impl Saver {
         });
 
         Ok(Self {
-            window,
             renderer,
+            window,
+            frame_pending: false,
             configured: false,
             inhibitor,
             shown_at: Instant::now(),
         })
+    }
+
+    /// Request a `wl_surface.frame` callback for the next frame, unless one is
+    /// already in flight.
+    ///
+    /// This is the throttle that keeps the per-frame loop at the compositor's
+    /// pace: layout events (configure / output changes) paint and call this too,
+    /// but they will not stack a second callback while the loop's own callback
+    /// is still pending. Once the callback fires, [`HowanApp::on_frame`] clears
+    /// the flag and re-requests, so exactly one callback is outstanding at a
+    /// time. The callback stops being re-requested when the saver is dropped.
+    fn request_frame_if_idle(&mut self, qh: &QueueHandle<HowanApp>) {
+        if self.frame_pending {
+            return;
+        }
+        let surface = self.window.wl_surface();
+        surface.frame(qh, surface.clone());
+        self.frame_pending = true;
     }
 
     /// Decide which phase the saver is currently in.

@@ -127,12 +127,17 @@ howan daemon --idle-timeout <seconds>
 ```
 
 1. Connect to Wayland and bind the durable globals (registry, seat, output,
-   `wl_compositor`, `xdg_wm_base`, `wl_shm`). **No surface is shown yet.**
+   `wl_compositor`, `xdg_wm_base`) and build the durable wgpu device (see
+   [50-shader-player.md](50-shader-player.md)). If no usable GPU adapter is
+   available (e.g. a session with no working Vulkan/GL driver) the device build
+   fails and the daemon exits non-zero with a diagnostic at startup — it never
+   hangs. **No surface is shown yet.**
 2. Start the idle source (the GNOME backend below). On failure to reach the
    idle transport the daemon exits non-zero with a diagnostic — it never hangs
    silently.
 3. When the idle source reports the seat has been idle for `T1`, create and map
-   the saver surface (the composited black overlay).
+   the saver surface (the composited overlay running the GPU-animated WGSL
+   shader — see [50-shader-player.md](50-shader-player.md)).
 4. On the first keyboard / pointer / touch input, dispatch by the two-phase
    lifecycle (see [Phase lifecycle](#phase-lifecycle)): drop the saver surface
    (`Inhibiting`). The durable Wayland state persists. The daemon re-arms the
@@ -149,10 +154,12 @@ howan daemon --idle-timeout <seconds>
 
 ### Surface lifecycle vs. process lifecycle
 
-`HowanApp` holds the durable Wayland state plus an `Option<Saver>`. The `Saver`
-(window + `wl_shm` renderer) is created on demand and dropped on dismiss, so the
-show → hide → show cycle is repeatable within one process. Two dismiss paths
-deliberately diverge:
+`HowanApp` holds the durable Wayland state (and the durable wgpu device) plus an
+`Option<Saver>`. The `Saver` (window + per-surface GPU renderer) is created on
+demand and dropped on dismiss, so the show → hide → show cycle is repeatable
+within one process; the expensive wgpu device is reused across cycles (see
+[50-shader-player.md](50-shader-player.md)). Two dismiss paths deliberately
+diverge:
 
 - **Input** calls `HowanApp::on_input()`, which dispatches by phase (see
   [Phase lifecycle](#phase-lifecycle)) and eventually calls `dismiss()` —
@@ -579,7 +586,12 @@ not yet released — a `wl_buffer` protocol error. The single-shot `start` path
 rarely triggered it; the daemon's repeated show/redraw cycles did. Fixed by
 taking a fresh buffer from the `SlotPool` on every `render` (the pool reuses a
 released slot when one is free, giving correct double-buffering); the re-run was
-clean. See `crates/howan/src/app/render.rs`.
+clean.
+
+> Historical: this `wl_shm` `SlotPool` renderer was later replaced by the
+> GPU-backed wgpu renderer (M6), where `present()` manages buffers, so this
+> specific failure mode no longer applies. Kept here as the record of the live
+> verification at the time. See [50-shader-player.md](50-shader-player.md).
 
 ### Stage 1 (safe) — live GNOME idle cycle
 

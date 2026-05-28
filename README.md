@@ -77,6 +77,9 @@ GNOME's `org.gnome.Mutter.IdleMonitor` and shows the saver when the seat has
 been idle for `T1`, staying resident across show/dismiss cycles. See
 [docs/guides/40-resident-daemon.md](docs/guides/40-resident-daemon.md).
 
+The saver renders a GPU-animated WGSL shader; see
+[docs/guides/50-shader-player.md](docs/guides/50-shader-player.md).
+
 `start`/`stop` are kept for manual testing. The earlier swayidle-driven
 activation is superseded by the daemon; see
 [docs/guides/20-swayidle.md](docs/guides/20-swayidle.md).
