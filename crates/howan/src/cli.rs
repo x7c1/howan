@@ -192,14 +192,14 @@ mod tests {
     }
 
     #[test]
-    fn daemon_removed_phase2_flag_is_rejected() {
-        // The previous Phase 2 flag was removed when locking was delegated
-        // to GNOME (Q-phase2-lock). Clap must reject it as an unknown
-        // argument so users with a pre-existing override notice the
-        // change instead of having it silently ignored.
+    fn daemon_removed_grace_timeout_flag_is_rejected() {
+        // `--grace-timeout` set the old lock-handoff timeout; it was removed
+        // when locking was delegated to GNOME (Q-phase2-lock). Clap must
+        // reject it as an unknown argument so users with a pre-existing
+        // override notice the change instead of having it silently ignored.
         assert!(
             Cli::try_parse_from(["howan", "daemon", "--grace-timeout", "30"]).is_err(),
-            "the removed Phase 2 flag must be rejected as an unknown argument"
+            "the removed --grace-timeout flag must be rejected as an unknown argument"
         );
     }
 }
