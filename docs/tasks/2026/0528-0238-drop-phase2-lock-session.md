@@ -176,19 +176,19 @@ Phase 2 / lock infrastructure is removed from `crates/howan/src/`.
 
 ### Manual / on-hardware (verified by a human before merge)
 
-- [ ] **Phase 2 boundary has no effect in the journal.** With the
+- [x] **Phase 2 boundary has no effect in the journal.** With the
       daemon running under defaults (`T1=300s`, `T_dpms=7200s`),
       stay idle past the historical `T_grace` boundary (1 h) but
       before `T_dpms` (2 h); confirm the journal shows no `phase
       transition`, no `lock-session` events, only the initial
       `idle detected` and `saver shown`.
-- [ ] **Input dismiss after one hour still works as Phase 1.**
+- [x] **Input dismiss after one hour still works as Phase 1.**
       Drive an input after staying idle for more than one hour (so
       historical Phase 2 territory); the saver dismisses with the
       same journal trail as a short Phase 1 dismiss — no
       `lock-session issued`, no `LockedHint`, no GNOME lock screen
       appears. The desktop is visible immediately on dismiss.
-- [ ] **Phase 3 still works.** Using a short-timer drop-in
+- [x] **Phase 3 still works.** Using a short-timer drop-in
       (`--idle-timeout 30 --dpms-timeout 90`), confirm the Phase 3
       journal trail: `idle detected` → `saver shown` → `phase
       transition 1->3` (or whatever the new event is named) →
@@ -196,7 +196,7 @@ Phase 2 / lock infrastructure is removed from `crates/howan/src/`.
       saver surface retained` → user-active watch armed → input →
       `saver dismissed` → `idle watch armed
       trigger="add_user_active_watch"`.
-- [ ] **GNOME-driven lock still works under user gsettings.** Set
+- [x] **GNOME-driven lock still works under user gsettings.** Set
       `gsettings set org.gnome.desktop.screensaver lock-delay 0` and
       keep `lock-enabled true`; idle past `T_dpms` and confirm that
       after the compositor's blank takes over, the next input lands
