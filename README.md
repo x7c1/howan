@@ -48,7 +48,7 @@ journalctl --user -u howan.service -f          # follow logs live
 ### Overriding CLI flags
 
 The unit launches `howan daemon` with no flags, so it uses the built-in
-defaults (`T1=5min`, `T_grace=60min`, `T_dpms=120min`). To override, edit
+defaults (`T1=5min`, `T_dpms=120min`). To override, edit
 `~/.config/systemd/user/howan.service`, then reload and restart:
 
 ```bash
@@ -67,7 +67,6 @@ you want it to survive re-install.
 ```bash
 howan daemon            # resident daemon: detect idle and show the saver autonomously
 howan daemon --idle-timeout 60     # idle seconds before the saver appears (default 300)
-howan daemon --grace-timeout 1800  # seconds before input switches to lock-session (default 3600)
 howan daemon --dpms-timeout 3600   # seconds before the daemon hands off to compositor DPMS (default 7200)
 howan start             # show the saver immediately (default when no subcommand is given)
 howan stop              # terminate a running `start` (no-op if none is running)
