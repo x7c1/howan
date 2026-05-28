@@ -9,7 +9,7 @@
 use smithay_client_toolkit::{
     compositor::CompositorHandler,
     delegate_compositor, delegate_output, delegate_pointer, delegate_registry, delegate_seat,
-    delegate_shm, delegate_touch, delegate_xdg_shell, delegate_xdg_window,
+    delegate_touch, delegate_xdg_shell, delegate_xdg_window,
     output::{OutputHandler, OutputState},
     registry::{ProvidesRegistryState, RegistryState},
     registry_handlers,
@@ -66,9 +66,14 @@ impl CompositorHandler for HowanApp {
         &mut self,
         _conn: &Connection,
         _qh: &QueueHandle<Self>,
-        _surface: &WlSurface,
+        surface: &WlSurface,
         _time: u32,
     ) {
+        // The Wayland frame callback fired: paint the next animated frame and
+        // re-request a callback. This is the per-frame render loop, paced by the
+        // compositor (typically vsync, ~60 Hz), which caps the FPS without a
+        // busy-loop. See `HowanApp::on_frame`.
+        self.on_frame(surface);
     }
 
     fn surface_enter(
@@ -397,7 +402,6 @@ impl ProvidesRegistryState for HowanApp {
 
 delegate_compositor!(HowanApp);
 delegate_output!(HowanApp);
-delegate_shm!(HowanApp);
 delegate_seat!(HowanApp);
 delegate_pointer!(HowanApp);
 delegate_touch!(HowanApp);

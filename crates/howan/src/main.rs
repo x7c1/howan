@@ -2,10 +2,11 @@
 //!
 //! Entry point and CLI dispatch. The primary mode is `howan daemon`: a resident
 //! process that owns idle detection (GNOME's `org.gnome.Mutter.IdleMonitor` over
-//! D-Bus) and shows the saver — an output-sized composited window with a solid
-//! black background — autonomously when the seat has been idle for `T1`. Input
-//! dismisses the saver but the daemon stays resident and re-arms for the next
-//! idle period. See `docs/guides/40-resident-daemon.md`.
+//! D-Bus) and shows the saver — an output-sized composited window running a
+//! GPU-animated WGSL shader (see `docs/guides/50-shader-player.md`) —
+//! autonomously when the seat has been idle for `T1`. Input dismisses the saver
+//! but the daemon stays resident and re-arms for the next idle period. See
+//! `docs/guides/40-resident-daemon.md`.
 //!
 //! `howan start` shows the saver immediately and exits on the first input;
 //! `howan stop` terminates a running `start`. They talk through a PID file and
