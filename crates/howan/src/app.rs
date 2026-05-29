@@ -49,10 +49,10 @@
 //!
 //! - `app.rs` (this file) holds `run`, `run_daemon`, and the top-level
 //!   `HowanApp` / `Saver` state.
-//! - `app::render` owns the GPU-backed WGSL renderer: the durable wgpu device /
-//!   pipeline ([`Gpu`]) and the per-surface [`Renderer`] that animates the
-//!   bundled shader once per Wayland frame callback. Isolating it here kept the
-//!   earlier swap from the `wl_shm` renderer local.
+//! - `app::render` owns the GPU-backed fragment-shader renderer: the durable
+//!   wgpu device / pipeline ([`Gpu`]) and the per-surface [`Renderer`] that
+//!   animates the chosen shader once per Wayland frame callback. Isolating it
+//!   here kept the earlier swap from the `wl_shm` renderer local.
 //! - `app::handlers` contains every Wayland-protocol handler trait impl
 //!   plus the `delegate_*!` macros.
 //!
@@ -68,6 +68,7 @@
 
 mod handlers;
 mod render;
+mod shader;
 
 use std::error::Error;
 use std::rc::Rc;
@@ -104,7 +105,7 @@ use wayland_protocols::wp::idle_inhibit::zv1::client::{
     zwp_idle_inhibitor_v1::ZwpIdleInhibitorV1,
 };
 
-use self::render::{Gpu, Renderer};
+use self::render::{Gpu, Renderer, ShaderInput};
 use crate::daemon::{IdleEvent, IdleSource};
 use crate::pidfile::PidFileGuard;
 
@@ -119,10 +120,24 @@ const INITIAL_HEIGHT: u32 = 720;
 /// exit flag is observed quickly after an input event is processed.
 const DISPATCH_TIMEOUT: Duration = Duration::from_millis(16);
 
+/// Map the optional `--shader <path>` CLI value to a [`ShaderInput`]: `None`
+/// selects the bundled WGSL default, `Some(path)` selects that file.
+fn shader_input(shader: Option<std::path::PathBuf>) -> ShaderInput {
+    match shader {
+        Some(path) => ShaderInput::File(path),
+        None => ShaderInput::BundledWgsl,
+    }
+}
+
 /// Run the saver (`howan start`). Blocks until the user dismisses the window,
 /// the compositor closes it, or a `SIGTERM`/`SIGINT` (e.g. from `howan stop`)
 /// arrives. This is the one-shot manual/debug path: input exits the process.
-pub fn run() -> Result<(), Box<dyn Error>> {
+///
+/// `shader` is the optional `--shader <path>` override: `None` plays the bundled
+/// WGSL shader (the default), `Some(path)` loads one shader file, choosing the
+/// WGSL or GLSL pipeline by extension. See [`HowanApp::new`] for the fallback
+/// behavior when the file fails to load.
+pub fn run(shader: Option<std::path::PathBuf>) -> Result<(), Box<dyn Error>> {
     // Publish our PID before opening the window so `howan stop` can reach us
     // for the entire visible lifetime. The guard removes the file on every
     // exit path, including an early `?` return below.
@@ -143,7 +158,13 @@ pub fn run() -> Result<(), Box<dyn Error>> {
     // The one-shot `start` path exits on the first input, so it never reaches
     // the DpmsHandoff state in practice. A `T_dpms` large enough never to fire
     // is sufficient.
-    let mut app = HowanApp::new(&globals, &qh, conn.clone(), Duration::from_secs(u64::MAX / 2))?;
+    let mut app = HowanApp::new(
+        &globals,
+        &qh,
+        conn.clone(),
+        Duration::from_secs(u64::MAX / 2),
+        shader_input(shader),
+    )?;
     // One-shot: show the saver immediately, then exit the process on dismiss.
     app.show_saver(&qh);
 
@@ -179,6 +200,7 @@ pub fn run() -> Result<(), Box<dyn Error>> {
 pub fn run_daemon(
     idle_source: Box<dyn IdleSource>,
     t_dpms: Duration,
+    shader: Option<std::path::PathBuf>,
 ) -> Result<(), Box<dyn Error>> {
     // Lifecycle: log the effective thresholds and the selected idle backend
     // exactly once at the top of the daemon run so `journalctl --user -u
@@ -222,7 +244,7 @@ pub fn run_daemon(
     // error and a non-zero exit instead of a silent hang.
     let _idle_handle = idle_source.start(idle_tx)?;
 
-    let mut app = HowanApp::new(&globals, &qh, conn.clone(), t_dpms)?;
+    let mut app = HowanApp::new(&globals, &qh, conn.clone(), t_dpms, shader_input(shader))?;
 
     // The DpmsHandoff timer source. We register/cancel a calloop Timer for
     // `t_dpms` whenever the saver is shown / dismissed.
@@ -420,8 +442,8 @@ pub(crate) enum SaverPhase {
 }
 
 /// The recreatable on-screen saver: an output-sized composited toplevel and the
-/// GPU-backed WGSL renderer that paints it. Dropped on dismiss; recreated each
-/// idle cycle by [`HowanApp::show_saver`].
+/// GPU-backed fragment-shader renderer that paints it. Dropped on dismiss;
+/// recreated each idle cycle by [`HowanApp::show_saver`].
 pub(crate) struct Saver {
     /// The wgpu renderer. Declared **before** `window` so it drops first: the
     /// wgpu surface inside it wraps the raw `wl_surface` pointer owned by
@@ -477,6 +499,7 @@ impl HowanApp {
         qh: &QueueHandle<HowanApp>,
         conn: Connection,
         t_dpms: Duration,
+        shader_input: ShaderInput,
     ) -> Result<Self, Box<dyn Error>> {
         let compositor = CompositorState::bind(globals, qh)
             .map_err(|err| format!("wl_compositor not available: {err}"))?;
@@ -486,7 +509,25 @@ impl HowanApp {
         // Build the durable wgpu state once. This is the expensive
         // adapter/device request plus shader-pipeline compilation; the
         // per-cycle `Saver` reuses it and only rebuilds the per-surface objects.
-        let gpu = Rc::new(Gpu::new()?);
+        //
+        // A `--shader <path>` file may fail to load, parse, or validate (e.g. a
+        // syntax error, or a multi-pass shader that references `iChannel0`). The
+        // daemon must stay usable rather than crash, so a failure here logs a
+        // clear error and falls back to the bundled WGSL shader — previewing the
+        // M8 directory-fallback behavior without implementing the directory
+        // scan. The bundled shader is compiled in and always valid, so a second
+        // failure (only possible from a GPU/device problem) is genuinely fatal.
+        let gpu = match Gpu::new(&shader_input) {
+            Ok(gpu) => Rc::new(gpu),
+            Err(err) if shader_input != ShaderInput::BundledWgsl => {
+                error!(
+                    error = %err,
+                    "failed to load --shader; falling back to the bundled shader"
+                );
+                Rc::new(Gpu::new(&ShaderInput::BundledWgsl)?)
+            }
+            Err(err) => return Err(err),
+        };
 
         // Bind the idle-inhibit manager through the existing GlobalList. This is
         // best-effort: a compositor without the global degrades to "no

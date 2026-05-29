@@ -87,15 +87,21 @@ howan daemon            # resident daemon: detect idle and show the saver autono
 howan daemon --idle-timeout 60     # idle seconds before the saver appears (default 300)
 howan daemon --dpms-timeout 3600   # seconds before the daemon hands off to compositor DPMS (default 7200)
 howan start             # show the saver immediately (default when no subcommand is given)
+howan start --shader path/to/shader.glsl   # play one shader file instead of the bundled default
 howan stop              # terminate a running `start` (no-op if none is running)
 ```
+
+`--shader <path>` (on `daemon` and `start`) plays a single shader file chosen by
+extension: `.wgsl` for WGSL, `.glsl` / `.frag` for a Shadertoy-convention GLSL
+`mainImage` shader. Without it, the bundled WGSL shader plays.
 
 `howan daemon` is the primary mode: a long-lived process that detects idle via
 GNOME's `org.gnome.Mutter.IdleMonitor` and shows the saver when the seat has
 been idle for `T1`, staying resident across show/dismiss cycles. See
 [docs/guides/40-resident-daemon.md](docs/guides/40-resident-daemon.md).
 
-The saver renders a GPU-animated WGSL shader; see
+The saver renders a GPU-animated shader — the bundled WGSL default, or a
+WGSL/GLSL (Shadertoy) file via `--shader`; see
 [docs/guides/50-shader-player.md](docs/guides/50-shader-player.md).
 
 `start`/`stop` are kept for manual testing. The earlier swayidle-driven

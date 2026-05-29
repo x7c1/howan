@@ -42,8 +42,16 @@ wayland-protocols = { version = "0.32", features = ["client", "unstable"] }
 # can hand-build the Wayland display/window handles from the `wl_display` /
 # `wl_surface` raw pointers (wayland-client does not expose an `rwh` feature for
 # this version). See docs/guides/50-shader-player.md.
-wgpu = "22"
-naga = "22"
+# `naga-ir` enables `wgpu::ShaderSource::Naga`, letting howan hand wgpu a
+# `naga::Module` it parsed + validated itself (the GLSL/Shadertoy path) instead
+# of raw source. The default features (WGSL, Vulkan, …) stay on.
+wgpu = { version = "22", features = ["naga-ir"] }
+# `glsl-in` enables naga's GLSL frontend so howan can accept Shadertoy-style
+# GLSL fragment shaders (M7). The source is parsed to a `naga::Module`, validated
+# with `naga::valid::Validator`, and handed to wgpu via `ShaderSource::Naga` —
+# the same naga IR + validation the WGSL path goes through, so GLSL never reaches
+# the driver as raw text. See docs/guides/50-shader-player.md.
+naga = { version = "22", features = ["glsl-in"] }
 raw-window-handle = "0.6"
 # `pollster` blocks on wgpu's async adapter/device requests so the renderer can
 # be created from the synchronous Wayland setup path without pulling in a full

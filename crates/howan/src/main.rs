@@ -3,8 +3,9 @@
 //! Entry point and CLI dispatch. The primary mode is `howan daemon`: a resident
 //! process that owns idle detection (GNOME's `org.gnome.Mutter.IdleMonitor` over
 //! D-Bus) and shows the saver — an output-sized composited window running a
-//! GPU-animated WGSL shader (see `docs/guides/50-shader-player.md`) —
-//! autonomously when the seat has been idle for `T1`. Input dismisses the saver
+//! GPU-animated fragment shader (the bundled WGSL default or a WGSL/GLSL file
+//! via `--shader`; see `docs/guides/50-shader-player.md`) — autonomously when
+//! the seat has been idle for `T1`. Input dismisses the saver
 //! but the daemon stays resident and re-arms for the next idle period. See
 //! `docs/guides/40-resident-daemon.md`.
 //!
@@ -38,11 +39,11 @@ fn main() -> ExitCode {
         Command::Daemon(args) => match args.validate() {
             Ok(()) => {
                 let idle_source = Box::new(MutterIdleSource::new(args.idle_timeout()));
-                app::run_daemon(idle_source, args.dpms_timeout())
+                app::run_daemon(idle_source, args.dpms_timeout(), args.shader())
             }
             Err(msg) => Err(msg.into()),
         },
-        Command::Start => app::run(),
+        Command::Start(args) => app::run(args.shader()),
         Command::Stop => pidfile::stop(),
     };
     match result {
