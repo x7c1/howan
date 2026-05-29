@@ -291,11 +291,12 @@ The two stages above proved the M6 WGSL bring-up. M7 adds the GLSL path; it
 reuses the *same* surface / scanout path (no `set_fullscreen`, no opaque region),
 so the Blackwell modeset-wedge risk is unchanged — Stage 2 here is a sanity
 check, not a first-ever GPU bring-up. Both stages use a real single-pass
-Shadertoy shader. A ready one ships at
-[`examples/shaders/shadertoy-rainbow.glsl`](../../examples/shaders/shadertoy-rainbow.glsl)
-(it runs unchanged on shadertoy.com too); it has a vertical brightness gradient
-that is dark toward the **bottom** of the screen, so the orientation (no
-vertical flip) is verifiable by eye.
+Shadertoy-convention shader. A ready one ships at
+[`examples/shaders/drifting-bands.glsl`](../../examples/shaders/drifting-bands.glsl)
+(written for howan, not copied from Shadertoy, but it runs unchanged on
+shadertoy.com too); it has a vertical brightness gradient that is dark toward the
+**bottom** of the screen, so the orientation (no vertical flip) is verifiable by
+eye.
 
 **Stage 1 (safe, software / headless).** Run the GLSL shader on a software
 (pixman) weston with the llvmpipe Vulkan ICD forced, exactly as in Stage 1
@@ -304,10 +305,10 @@ above, but pass `--shader`:
 ```bash
 VK_ICD_FILENAMES=/usr/share/vulkan/icd.d/lvp_icd.json \
 WAYLAND_DISPLAY=wayland-stage1 \
-  timeout 6 cargo run -- start --shader examples/shaders/shadertoy-rainbow.glsl
+  timeout 6 cargo run -- start --shader examples/shaders/drifting-bands.glsl
 ```
 
-Confirm: the shader renders and **visibly animates** (the rainbow drifts with
+Confirm: the shader renders and **visibly animates** (the color bands drift with
 `iTime`), the gradient is darker at the bottom (correct orientation, not flipped)
 and the aspect is not stretched, and input dismisses it.
 

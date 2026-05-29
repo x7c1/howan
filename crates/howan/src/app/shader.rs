@@ -298,12 +298,12 @@ void mainImage(out vec4 fragColor, in vec2 fragCoord) {
     }
 
     /// The example shader shipped for Stage 1 verification
-    /// (`examples/shaders/shadertoy-rainbow.glsl`, referenced by the guide)
+    /// (`examples/shaders/drifting-bands.glsl`, referenced by the guide)
     /// must compile through the real path, so the documented reproduction
     /// cannot silently rot.
     #[test]
     fn shipped_example_shader_compiles() {
-        let src = include_str!("../../../../examples/shaders/shadertoy-rainbow.glsl");
+        let src = include_str!("../../../../examples/shaders/drifting-bands.glsl");
         compile_glsl(src).expect("the shipped example shader must validate");
     }
 
