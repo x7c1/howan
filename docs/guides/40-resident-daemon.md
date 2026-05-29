@@ -38,6 +38,10 @@ Key points:
 - **Locking the session is delegated to GNOME.** Configure GNOME directly
   for lock-on-idle — see [Locking is delegated to
   GNOME](#locking-is-delegated-to-gnome).
+- GNOME's automatic suspend is **also** gated by the idle inhibitor, so the
+  effective time-to-suspend is `T_dpms + sleep-inactive-*-timeout` rather than
+  the configured GNOME timeout alone — see [Auto-suspend is also gated by the
+  inhibitor](#auto-suspend-is-also-gated-by-the-inhibitor).
 - Lifecycle events (daemon start, idle detected, saver shown, phase
   transitions, inhibitor acquired/released, shutdown) are emitted via
   `tracing` to stderr, which the systemd `--user` unit captures into the
@@ -261,6 +265,57 @@ The rationale for not driving the lock from howan (the visible black gap
 when `ext-session-lock-v1` mounts under Mutter, and the N1 "don't
 implement a locker" non-goal) is recorded in Q-phase2-lock in the howan
 plan.
+
+#### Auto-suspend is also gated by the inhibitor
+
+GNOME drives screen blank/DPMS **and** automatic suspend off the **same**
+session idle state — Mutter's `IdleMonitor`. They are not independent paths:
+the suspend action shares the very clock that the saver's idle inhibitor
+silences.
+
+While the saver is in the `Inhibiting` phase, howan holds the
+`zwp_idle_inhibit` inhibitor, which makes Mutter treat the session as
+non-idle and blinds its `IdleMonitor` — the same blinding already documented
+in [Suppressing DPMS while the saver is
+shown](#suppressing-dpms-while-the-saver-is-shown) and in the
+[post-DpmsHandoff active-watch gate](#post-dpmshandoff-active-watch-gate).
+Because GNOME's auto-suspend timer (`org.gnome.settings-daemon.plugins.power
+sleep-inactive-ac-timeout` / `sleep-inactive-battery-timeout`) is driven off
+that same idle state, **the suspend countdown does not advance during
+`Inhibiting`**. This mirrors the lock-on-idle behavior described just above:
+GNOME's idle-driven actions are all deferred until the inhibitor is released
+at the handoff.
+
+The suspend timer only begins counting **after** the `DpmsHandoff` releases
+the inhibitor at `T_dpms`. The effective time from saver-show to suspend is
+therefore approximately `T_dpms + sleep-inactive-*-timeout` (measured from
+idle-start it is additionally offset by `T1`, the idle period before the
+saver appears).
+
+Concretely, with the default `T_dpms` of 2h and a GNOME AC suspend timeout
+of 6h, the machine suspends roughly **8h** after the saver appears — not 6h.
+This is working as designed: it is a direct consequence of holding the idle
+inhibitor, not a bug.
+
+To make the machine suspend sooner:
+
+- Account for this summation when choosing `sleep-inactive-ac-timeout` /
+  `sleep-inactive-battery-timeout` — the value you set is added on top of
+  `T_dpms`, not counted from idle-start.
+- Consider shortening `--dpms-timeout` (`T_dpms`) so the inhibitor is
+  released earlier and GNOME's suspend countdown starts sooner.
+- Ensure `sleep-inactive-ac-type` / `sleep-inactive-battery-type` is
+  `suspend`, or no suspend will occur regardless of the timeouts.
+
+```sh
+# Suspend on AC after the screen has been idle for the timeout (note this
+# only starts counting once the inhibitor is released at T_dpms).
+gsettings set org.gnome.settings-daemon.plugins.power sleep-inactive-ac-type 'suspend'
+gsettings set org.gnome.settings-daemon.plugins.power sleep-inactive-ac-timeout 21600  # 6h
+
+# Release the inhibitor sooner so the suspend countdown starts earlier.
+howan daemon --dpms-timeout 1800  # T_dpms = 30min
+```
 
 ### Post-DpmsHandoff: active-watch gate
 
