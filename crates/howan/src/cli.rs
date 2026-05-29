@@ -15,9 +15,10 @@
 //! interactive case ("just show the saver now"), matching the original M1
 //! binary.
 
+use std::path::PathBuf;
 use std::time::Duration;
 
-use clap::{Parser, Subcommand};
+use clap::{Args, Parser, Subcommand};
 
 use crate::daemon::DEFAULT_T1;
 
@@ -44,9 +45,39 @@ pub enum Command {
     /// Run the resident daemon: detect idle and show the saver autonomously.
     Daemon(DaemonArgs),
     /// Launch the saver immediately (blocks until dismissed or stopped).
-    Start,
+    Start(StartArgs),
     /// Terminate a running saver. A no-op success if none is running.
     Stop,
+}
+
+/// The `--shader <path>` override shared by `daemon` and `start`.
+///
+/// Loads a single shader from an explicit path instead of the bundled WGSL
+/// default, choosing the pipeline by extension (`.wgsl` → WGSL; `.glsl` /
+/// `.frag` → GLSL, the Shadertoy `mainImage` convention). When absent, the
+/// bundled WGSL shader plays — behavior is unchanged from M6. This is the
+/// smallest seam that proves "a Shadertoy paste runs in howan"; directory
+/// scanning / playlists are a later milestone. See
+/// `docs/guides/50-shader-player.md`.
+#[derive(Debug, Args, PartialEq, Eq)]
+pub struct ShaderArg {
+    /// Path to a single shader file to play (`.wgsl`, `.glsl`, or `.frag`).
+    #[arg(long = "shader", value_name = "PATH")]
+    pub shader: Option<PathBuf>,
+}
+
+/// Arguments for `howan start`.
+#[derive(Debug, Parser, PartialEq, Eq)]
+pub struct StartArgs {
+    #[command(flatten)]
+    shader: ShaderArg,
+}
+
+impl StartArgs {
+    /// The effective `--shader` path, if given.
+    pub fn shader(&self) -> Option<PathBuf> {
+        self.shader.shader.clone()
+    }
 }
 
 /// Arguments for `howan daemon`.
@@ -66,6 +97,9 @@ pub struct DaemonArgs {
     /// Defaults to 7200 (2 hours). Must be greater than zero.
     #[arg(long = "dpms-timeout", value_name = "SECONDS")]
     dpms_timeout_secs: Option<u64>,
+
+    #[command(flatten)]
+    shader: ShaderArg,
 }
 
 impl DaemonArgs {
@@ -85,6 +119,11 @@ impl DaemonArgs {
             .unwrap_or(Duration::from_secs(DEFAULT_T_DPMS_SECS))
     }
 
+    /// The effective `--shader` path, if given.
+    pub fn shader(&self) -> Option<PathBuf> {
+        self.shader.shader.clone()
+    }
+
     /// Reject a degenerate `T_dpms` of zero: it would fire the handoff timer
     /// at saver-show, collapsing the `Inhibiting` state to nothing. Called from
     /// `main` before the daemon starts.
@@ -99,9 +138,12 @@ impl DaemonArgs {
 
 impl Cli {
     /// The effective command, applying the "no subcommand means `start`"
-    /// default.
+    /// default. The defaulted `start` carries no `--shader` override (the
+    /// bundled WGSL shader plays).
     pub fn into_command(self) -> Command {
-        self.command.unwrap_or(Command::Start)
+        self.command.unwrap_or(Command::Start(StartArgs {
+            shader: ShaderArg { shader: None },
+        }))
     }
 }
 
@@ -118,14 +160,14 @@ mod tests {
     #[test]
     fn no_subcommand_defaults_to_start() {
         let cli = Cli::parse_from(["howan"]);
-        assert!(matches!(cli.into_command(), Command::Start));
+        assert!(matches!(cli.into_command(), Command::Start(_)));
     }
 
     #[test]
     fn explicit_subcommands_parse() {
         assert!(matches!(
             Cli::parse_from(["howan", "start"]).into_command(),
-            Command::Start
+            Command::Start(_)
         ));
         assert!(matches!(
             Cli::parse_from(["howan", "stop"]).into_command(),
@@ -189,6 +231,42 @@ mod tests {
             panic!("expected daemon command");
         };
         assert!(args.validate().is_ok());
+    }
+
+    #[test]
+    fn start_without_shader_flag_has_no_override() {
+        let Command::Start(args) = Cli::parse_from(["howan", "start"]).into_command() else {
+            panic!("expected start command");
+        };
+        assert_eq!(args.shader(), None);
+    }
+
+    #[test]
+    fn start_shader_flag_is_parsed() {
+        let Command::Start(args) =
+            Cli::parse_from(["howan", "start", "--shader", "/x/foo.glsl"]).into_command()
+        else {
+            panic!("expected start command");
+        };
+        assert_eq!(args.shader(), Some(PathBuf::from("/x/foo.glsl")));
+    }
+
+    #[test]
+    fn daemon_shader_flag_is_parsed() {
+        let Command::Daemon(args) =
+            Cli::parse_from(["howan", "daemon", "--shader", "/x/bar.frag"]).into_command()
+        else {
+            panic!("expected daemon command");
+        };
+        assert_eq!(args.shader(), Some(PathBuf::from("/x/bar.frag")));
+    }
+
+    #[test]
+    fn daemon_without_shader_flag_has_no_override() {
+        let Command::Daemon(args) = Cli::parse_from(["howan", "daemon"]).into_command() else {
+            panic!("expected daemon command");
+        };
+        assert_eq!(args.shader(), None);
     }
 
     #[test]

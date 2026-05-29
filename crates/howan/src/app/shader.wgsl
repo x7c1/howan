@@ -1,12 +1,16 @@
 // Bundled fragment shader for the howan saver (M6).
 //
 // Compiled into the binary with `include_str!` (see `render.rs`) and built into
-// a wgpu render pipeline at runtime. It is driven by two uniforms that mirror
-// the well-known Shadertoy names so later GLSL/Shadertoy compatibility (M7) is a
-// small step:
+// a wgpu render pipeline at runtime. It is driven by the Shadertoy-style uniform
+// set, which mirrors the well-known Shadertoy names so GLSL/Shadertoy
+// compatibility (M7) shares one uniform buffer:
 //
-//   iTime       seconds since the saver became visible (resets each cycle)
 //   iResolution surface size as vec3(width, height, width / height)
+//   iTime       seconds since the saver became visible (resets each cycle)
+//   iTimeDelta  seconds since the previous frame
+//   iFrame      frame counter since the saver became visible
+//   iMouse      pointer state — ALWAYS zero in howan (idle, no pointer tracking)
+//   iDate       wall clock as (year, month, day, seconds-in-day)
 //
 // The vertex stage emits a single full-screen triangle (three vertices, no
 // vertex buffer) so the fragment stage runs once per surface pixel. The
@@ -18,11 +22,20 @@
 // latter, which is what keeps the surface off Mutter's scanout fast path. See
 // docs/guides/30-composited-surface.md.
 
+// The field order and std140 padding MUST match `struct Uniforms` in `render.rs`
+// and the Shadertoy GLSL uniform block in `shader.rs` (the GLSL prelude). A
+// `vec3<f32>` and a `vec4<f32>` are both 16-byte aligned in a WGSL uniform:
+// `i_time` fills the slot after the `vec3`, and `_pad` carries `iMouse` to the
+// next 16-byte boundary. See render.rs's `Uniforms` doc for the byte offsets.
 struct Uniforms {
-    // vec3 + 1 float of padding so the struct matches the 16-byte std140-style
-    // alignment wgpu expects for a uniform buffer.
     i_resolution: vec3<f32>,
     i_time: f32,
+    i_time_delta: f32,
+    i_frame: i32,
+    // Two floats of padding so the following vec4 starts on a 16-byte boundary.
+    _pad: vec2<f32>,
+    i_mouse: vec4<f32>,
+    i_date: vec4<f32>,
 };
 
 @group(0) @binding(0)

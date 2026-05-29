@@ -1,21 +1,27 @@
-# WGSL Shader Player
+# Shader Player
 
 ## Overview
 
-This guide explains how howan renders its saver: a single bundled WGSL fragment
-shader, animated over time on the GPU through [wgpu], replacing the earlier
-solid-black `wl_shm` renderer (milestone M6 — the first time howan shows moving
-visuals).
+This guide explains how howan renders its saver: a fragment shader animated over
+time on the GPU through [wgpu], replacing the earlier solid-black `wl_shm`
+renderer. The **default** is a single WGSL shader compiled into the binary
+(milestone M6 — the first time howan shows moving visuals). M7 adds a second
+input language — **GLSL written to the Shadertoy convention** — so a shader
+copy-pasted from [Shadertoy] runs in howan via `--shader <path>` (see
+[GLSL / Shadertoy shaders](#glsl--shadertoy-shaders)).
 
 Key points:
 
-- The shader is **compiled into the binary** (`include_str!` of
+- The default shader is **compiled into the binary** (`include_str!` of
   `crates/howan/src/app/shader.wgsl`) and built into a wgpu render pipeline at
-  runtime. Nothing is read from the filesystem; there is no shader directory,
-  playlist, or GLSL/Shadertoy support yet (those are later milestones).
-- Two uniforms drive it: `iTime` (seconds since the saver became visible) and
-  `iResolution` (`vec3(width, height, width / height)`), mirroring the
-  well-known Shadertoy names.
+  runtime. When `--shader` is not given, nothing is read from the filesystem.
+  There is no shader directory, playlist, or rotation yet (that is a later
+  milestone); `--shader <path>` loads exactly one file.
+- The full **Shadertoy-style uniform set** drives it — `iResolution`, `iTime`,
+  `iTimeDelta`, `iFrame`, `iMouse`, `iDate` — mirroring the well-known Shadertoy
+  names so a pasted shader links. `iMouse` is **always zero** (the saver is
+  idle and does not track the pointer). See
+  [Uniforms](#uniforms) for each field's howan value.
 - A **Wayland frame-callback loop** paces the animation: each `wl_surface.frame`
   callback paints the next frame and requests another, so the FPS is capped by
   the compositor (typically vsync) with no busy-loop.
@@ -81,18 +87,83 @@ load-bearing — do not reorder it.
 
 ## Uniforms
 
-`render::uniforms(elapsed, width, height)` is a pure function (unit-tested
-without a GPU or Wayland connection) that computes the uniform block:
+`render::uniforms(...)` computes the uniform block; it is pure and unit-tested
+without a GPU or Wayland connection (the wall-clock `iDate` is the one field
+supplied by the caller, `render::i_date_now`, since it is not a pure function of
+the inputs). The block is uploaded to the uniform buffer once per frame before
+the draw, and is shared by the WGSL and GLSL paths — the same buffer, the same
+field order. The fields and their howan values:
 
-- `iTime` = `elapsed.as_secs_f32()`, where `elapsed = now - Saver::shown_at`.
-  `shown_at` resets every idle cycle, so the animation restarts from ~0 each
-  time the saver appears.
-- `iResolution` = `[width, height, width / height]`. The `.z` component is the
-  aspect ratio (width over height); the shader uses it to avoid stretching the
-  pattern on non-square surfaces. A zero height degrades to a `0.0` aspect
-  rather than a non-finite value.
+- `iResolution` (`vec3`) = `[width, height, width / height]`. The `.z` component
+  is the aspect ratio (width over height); the shader uses it to avoid
+  stretching the pattern on non-square surfaces. A zero height degrades to a
+  `0.0` aspect rather than a non-finite value.
+- `iTime` (`float`) = `elapsed.as_secs_f32()`, where `elapsed = now -
+  Saver::shown_at`. `shown_at` resets every idle cycle, so the animation
+  restarts from ~0 each time the saver appears.
+- `iTimeDelta` (`float`) = seconds since the previous presented frame (`0` on
+  the first frame of a cycle).
+- `iFrame` (`int`) = frame counter since the saver became visible (`0` on the
+  first frame of a cycle).
+- `iMouse` (`vec4`) = **always `[0, 0, 0, 0]`**. The saver is a passive idle
+  overlay and does not track the pointer; the uniform is provided only so a
+  pasted Shadertoy shader that reads it still links.
+- `iDate` (`vec4`) = `(year, month, day, seconds-since-midnight)` from the local
+  wall clock at frame time.
 
-The block is uploaded to the uniform buffer once per frame before the draw.
+### Layout discipline
+
+The Rust `Uniforms` struct (`render.rs`), the WGSL `struct Uniforms`
+(`shader.wgsl`), and the Shadertoy GLSL uniform block (the prelude in
+`shader.rs`) must stay field-for-field identical, including std140 padding. The
+byte offsets (vec3+float | float+int+2 floats of padding | vec4 | vec4 = 64
+bytes) are documented on `render::Uniforms`; a `uniforms_struct_matches_std140_layout`
+unit test pins the size. Adding or reordering a field means editing all three.
+
+## GLSL / Shadertoy shaders
+
+[Shadertoy] shaders are GLSL fragment shaders that define
+
+```glsl
+void mainImage(out vec4 fragColor, in vec2 fragCoord) { ... }
+```
+
+rather than a GLSL `main`. howan accepts one via `--shader <path>` on both the
+`daemon` and `start` subcommands, choosing the pipeline by file extension:
+`.wgsl` → WGSL, `.glsl` / `.frag` → GLSL. Without `--shader`, the bundled WGSL
+shader plays (unchanged from M6).
+
+How a GLSL file reaches the GPU (in `crates/howan/src/app/shader.rs`):
+
+1. **Single-pass guard.** A source that references a texture/audio channel
+   (`iChannel0..3`) is rejected with a clear, typed error. howan supports only a
+   single-pass `mainImage`; Shadertoy multi-buffer shaders (Buffer A/B/C/D) and
+   channel inputs are out of scope.
+2. **mainImage wrapper.** howan prepends the Shadertoy uniform block + a fragment
+   output, and appends a synthesized `main` that calls `mainImage` with the pixel
+   coordinate, then writes its `fragColor` to the output. naga only ever sees
+   standard GLSL with a real `main`.
+3. **y-flip.** Shadertoy's `fragCoord` origin is bottom-left; wgpu/Vulkan
+   framebuffer coordinates are top-left, so the wrapper flips y
+   (`iResolution.y - gl_FragCoord.y`) before calling `mainImage`. Without this a
+   pasted shader would render upside-down.
+4. **Parse + validate.** The wrapped source is parsed by `naga::front::glsl` to a
+   `naga::Module` and validated with `naga::valid::Validator` — the **same** naga
+   IR + validation the WGSL path goes through, so GLSL never reaches the driver as
+   raw text. The validated module is handed to wgpu via `ShaderSource::Naga`. The
+   vertex stage stays the bundled WGSL full-screen triangle; only the fragment
+   stage comes from the GLSL file.
+
+This shares the M6 frame-callback loop, device lifetime, and uniform buffer
+unchanged; see [The frame-callback loop](#the-frame-callback-loop).
+
+### Resilient fallback
+
+A `--shader` file that fails to read, parse, or validate (a syntax error, an
+unrecognized extension, or an `iChannel0` reference) does **not** crash the
+daemon: the failure is logged with a clear error and the daemon falls back to the
+bundled WGSL shader. This previews the M8 "empty/missing directory → bundled
+fallback" behavior without implementing the directory scan.
 
 ## The frame-callback loop
 
@@ -214,6 +285,50 @@ Verify when convenient; it is independent of the GPU-rendering path proven above
 NVIDIA ICD. That is a build-environment detail, not part of the saver — see the
 next section for the opt-in way to make this stick for the installed daemon.)
 
+### GLSL / Shadertoy verification (M7)
+
+The two stages above proved the M6 WGSL bring-up. M7 adds the GLSL path; it
+reuses the *same* surface / scanout path (no `set_fullscreen`, no opaque region),
+so the Blackwell modeset-wedge risk is unchanged — Stage 2 here is a sanity
+check, not a first-ever GPU bring-up. Both stages use a real single-pass
+Shadertoy-convention shader. A ready one ships at
+[`examples/shaders/drifting-bands.glsl`](../../examples/shaders/drifting-bands.glsl)
+(written for howan, not copied from Shadertoy, but it runs unchanged on
+shadertoy.com too); it has a vertical brightness gradient that is dark toward the
+**bottom** of the screen, so the orientation (no vertical flip) is verifiable by
+eye.
+
+**Stage 1 (safe, software / headless).** Run the GLSL shader on a software
+(pixman) weston with the llvmpipe Vulkan ICD forced, exactly as in Stage 1
+above, but pass `--shader`:
+
+```bash
+VK_ICD_FILENAMES=/usr/share/vulkan/icd.d/lvp_icd.json \
+WAYLAND_DISPLAY=wayland-stage1 \
+  timeout 6 cargo run -- start --shader examples/shaders/drifting-bands.glsl
+```
+
+Confirm: the shader renders and **visibly animates** (the color bands drift with
+`iTime`), the gradient is darker at the bottom (correct orientation, not flipped)
+and the aspect is not stretched, and input dismisses it.
+
+**Status: NOT YET RUN.** Outstanding gate — record the observed result, the exact
+shader used, and the weston/ICD versions here once performed.
+
+**Stage 2 (Blackwell sanity check, SSH-guarded).** Run the same GLSL shader on
+the actual NVIDIA Blackwell + GNOME/Mutter session, **logged in over SSH from a
+second machine** (follow the SSH-guard procedure referenced in Stage 2 above; do
+not force the llvmpipe ICD here). Confirm it renders via wgpu without wedging the
+display engine / GSP firmware, dismisses on input within ~100 ms, and that
+`SIGTERM`/`SIGINT` still unwind the clean-exit path. Also confirm once by hand
+that a malformed or channel-using GLSL file (e.g. one referencing `iChannel0`) is
+rejected with a readable error and the daemon falls back to the bundled shader
+rather than crashing.
+
+**Status: NOT YET RUN.** Outstanding gate — lower-risk than the M6 Stage 2
+(surface/scanout path unchanged), but confirm rather than assume; record the
+result here once performed.
+
 ## GPU runtime libraries on a non-FHS build
 
 The wgpu renderer loads the Vulkan loader (`libvulkan.so.1`) and the GPU driver
@@ -273,3 +388,4 @@ back to a software rasterizer (llvmpipe): rendering works but on the CPU, so the
 GPU paths are still not being found.
 
 [wgpu]: https://wgpu.rs/
+[Shadertoy]: https://www.shadertoy.com/
