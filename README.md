@@ -62,6 +62,24 @@ discarding local edits. Apply the same edit to
 [`packaging/systemd/howan.service`](packaging/systemd/howan.service) if
 you want it to survive re-install.
 
+### GPU library paths for a non-FHS build (opt-in)
+
+A normal system-toolchain build needs nothing here. But a binary built with a
+non-FHS toolchain (e.g. Nix) on an FHS distro cannot find the Vulkan loader /
+GPU driver at runtime, so the daemon fails to find a GPU. For that case, copy
+the example drop-in and adapt it to your machine:
+
+```bash
+mkdir -p ~/.config/systemd/user/howan.service.d
+cp packaging/systemd/howan.service.d/override.conf.example \
+   ~/.config/systemd/user/howan.service.d/override.conf
+# edit the copy with your machine's paths (the file explains how to find them)
+systemctl --user daemon-reload && systemctl --user restart howan.service
+```
+
+See [docs/guides/50-shader-player.md](docs/guides/50-shader-player.md#gpu-runtime-libraries-on-a-non-fhs-build)
+for when this is needed and how to discover the correct values.
+
 ## Run
 
 ```bash

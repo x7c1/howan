@@ -1,0 +1,52 @@
+# howan.service systemd drop-in — EXAMPLE (opt-in, not auto-loaded)
+#
+# This file is named `*.example`, NOT `*.conf`, so systemd never auto-loads it.
+# It takes effect only after you copy it to the active drop-in path and reload:
+#
+#   mkdir -p ~/.config/systemd/user/howan.service.d
+#   cp packaging/systemd/howan.service.d/override.conf.example \
+#      ~/.config/systemd/user/howan.service.d/override.conf
+#   # edit the copy to match your machine (see below), then:
+#   systemctl --user daemon-reload && systemctl --user restart howan.service
+#
+# WHEN YOU NEED THIS
+# ------------------
+# Only for a binary built with a NON-FHS toolchain running on an FHS distro —
+# the concrete case being a Nix-toolchain build on Ubuntu. Such a binary uses a
+# dynamic loader that does not search the FHS `ld.so` paths, so it cannot find
+# the Vulkan loader (`libvulkan.so.1`) or the GPU driver's Vulkan ICD at
+# runtime, and the daemon fails to find a wgpu adapter.
+#
+# You do NOT need this for a normal system-toolchain build (e.g. the binary
+# produced by `cargo install` with your distro's toolchain): the FHS loader
+# finds `libvulkan.so.1` through the `ld.so` cache, and the Vulkan loader finds
+# the GPU's ICD manifest in its default search dir (`/usr/share/vulkan/icd.d`).
+# No environment variables are needed in that case — leave this drop-in unused.
+#
+# HOW TO FIND THE CORRECT VALUES FOR YOUR MACHINE
+# -----------------------------------------------
+#   * LD_LIBRARY_PATH — the FHS directory that holds `libvulkan.so.1`:
+#       ldconfig -p | grep libvulkan
+#     and use the directory part of the reported path.
+#   * VK_ICD_FILENAMES — your GPU vendor's ICD manifest:
+#       ls /usr/share/vulkan/icd.d/
+#     pick the manifest for your installed GPU driver (e.g. `nvidia_icd.json`
+#     for NVIDIA, `radeon_icd.*.json` for AMD, `intel_icd.*.json` for Intel).
+#
+# The values below are a WORKED EXAMPLE for Ubuntu + NVIDIA. They are a sample
+# to adapt, NOT a universal default: the multiarch lib dir name differs across
+# distros, and the ICD filename is vendor-specific (the NVIDIA path will not
+# work on AMD/Intel). Replace both with the values you discovered above.
+#
+# VERIFY IT WORKED
+# ----------------
+# After reloading, watch the journal as the saver next renders (idle cycle or
+# `howan start`):
+#   journalctl --user -u howan.service -f
+# A working override logs `wgpu adapter selected` with `device_type: DiscreteGpu`.
+# `no suitable wgpu adapter found` means the paths above are still wrong;
+# `device_type: Cpu` means it fell back to a software rasterizer (GPU not found).
+
+[Service]
+Environment=LD_LIBRARY_PATH=/usr/lib/x86_64-linux-gnu
+Environment=VK_ICD_FILENAMES=/usr/share/vulkan/icd.d/nvidia_icd.json
