@@ -27,6 +27,11 @@ Key points:
   is safety-critical on NVIDIA Blackwell; that rationale is not repeated here.
 - There is **no per-GPU / per-vendor branching**: the wgpu path is the single,
   unconditional renderer for all hardware.
+- The GPU path is loaded at runtime, so it adds a runtime dependency on the
+  Vulkan loader and the GPU driver's ICD. A normal system-toolchain build finds
+  both through the FHS defaults; a non-FHS-toolchain build (e.g. Nix on an FHS
+  distro) needs an opt-in systemd drop-in — see
+  [GPU runtime libraries on a non-FHS build](#gpu-runtime-libraries-on-a-non-fhs-build).
 
 ## Architecture
 
@@ -206,6 +211,65 @@ Verify when convenient; it is independent of the GPU-rendering path proven above
 
 (The dev binary was built with a non-FHS toolchain, so the run set
 `LD_LIBRARY_PATH` + `VK_ICD_FILENAMES` to reach the system Vulkan loader and
-NVIDIA ICD. That is a build-environment detail, not part of the saver.)
+NVIDIA ICD. That is a build-environment detail, not part of the saver — see the
+next section for the opt-in way to make this stick for the installed daemon.)
+
+## GPU runtime libraries on a non-FHS build
+
+The wgpu renderer loads the Vulkan loader (`libvulkan.so.1`) and the GPU driver
+(via the Vulkan ICD) at runtime, not at build time. How those are found depends
+on the toolchain the binary was built with. "FHS" below is the Filesystem
+Hierarchy Standard — the conventional `/usr/lib`, `/usr/share`, … layout that
+mainstream distros (Ubuntu, Fedora, …) follow and that the system loader
+searches by default; Nix deliberately does not follow it.
+
+- **Normal system-toolchain build** (the binary `cargo install` produces with
+  your distro's toolchain): no configuration is needed. The dynamic loader
+  finds `libvulkan.so.1` through the FHS `ld.so` cache, and the Vulkan loader
+  finds the GPU's ICD manifest in its default search dir
+  (`/usr/share/vulkan/icd.d`). The shipped unit and `make install` set no GPU
+  environment variables, and none are required.
+
+- **Non-FHS-toolchain build on an FHS distro** (the concrete case being a
+  Nix-toolchain build on Ubuntu): the binary uses a dynamic loader that does
+  not search the FHS paths, so it cannot find `libvulkan.so.1` or the GPU
+  driver's ICD. The daemon then fails to find a wgpu adapter unless it is told
+  where to look via `LD_LIBRARY_PATH` (the FHS lib dir) and `VK_ICD_FILENAMES`
+  (the GPU's ICD manifest). This is a build-environment mismatch, not a defect
+  in howan, and it affects only that unusual setup.
+
+The fix for the installed `--user` daemon is an **opt-in systemd drop-in**, not
+a change to the shipped unit. The values are distro- and vendor-specific (the
+multiarch lib dir name differs across distros; an NVIDIA ICD path breaks
+AMD/Intel users), so baking them into `make install` would break most
+environments. Instead, copy the example fragment and adapt it:
+
+```bash
+mkdir -p ~/.config/systemd/user/howan.service.d
+cp packaging/systemd/howan.service.d/override.conf.example \
+   ~/.config/systemd/user/howan.service.d/override.conf
+# edit the copy with your machine's paths, then:
+systemctl --user daemon-reload && systemctl --user restart howan.service
+```
+
+The example
+([`packaging/systemd/howan.service.d/override.conf.example`](../../packaging/systemd/howan.service.d/override.conf.example))
+is `*.example`, not `*.conf`, so systemd never auto-loads it; it takes effect
+only once copied to `override.conf` as above. Its comments show how to discover
+the correct `LD_LIBRARY_PATH` and `VK_ICD_FILENAMES` values for your machine.
+
+To confirm the override took effect, watch the daemon's journal as it next
+renders the saver (trigger an idle cycle or run `howan start`):
+
+```bash
+journalctl --user -u howan.service -f
+```
+
+A working override logs `wgpu adapter selected` with `device_type: DiscreteGpu`
+(your real GPU, e.g. `backend: Vulkan, NVIDIA`). `no suitable wgpu adapter
+found` means the dynamic loader still cannot reach the Vulkan loader or ICD — re-check
+the two paths in your `override.conf`. A `device_type: Cpu` line means it fell
+back to a software rasterizer (llvmpipe): rendering works but on the CPU, so the
+GPU paths are still not being found.
 
 [wgpu]: https://wgpu.rs/
