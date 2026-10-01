@@ -431,11 +431,15 @@ the crate.
   `GetIdletime` synchronously. If the IdleMonitor interface is unavailable (e.g.
   a non-GNOME session, or no session bus), `start` returns an error and `howan
   daemon` exits non-zero with a clear diagnostic instead of hanging.
-- **Re-arm strategy.** `AddIdleWatch(interval_ms)` is one-shot — it fires
-  `WatchFired(id)` once when the seat has been idle for `interval_ms` and does
-  **not** re-fire on later idle periods. To get an event on *every* idle period
-  the backend thread re-adds an idle watch after each cycle, driven by the
-  daemon. The daemon picks one of two re-arm primitives depending on which
+- **Re-arm strategy.** Mutter keeps an `AddIdleWatch(interval_ms)` watch
+  registered after it fires: it fires `WatchFired(id)` again every time the
+  seat's idle time crosses `interval_ms`, until `RemoveWatch(id)`. The backend
+  thread therefore removes each idle watch as soon as it fires and adds the
+  next one only when the daemon asks for it, so at most one watch is live at a
+  time. A watch left registered would add one more `WatchFired` per idle
+  period on every cycle; the thread does not read signals while it waits for
+  the daemon, and once 64 unread signals pile up zbus stops reading the
+  connection, so the next D-Bus call never returns and idle detection stops. The daemon picks one of two re-arm primitives depending on which
   dismiss path ran (the choice is computed daemon-side and forwarded to the
   backend as a `RearmKind`):
     - **`Immediate`** — after an `Inhibiting` input dismiss. The user just
