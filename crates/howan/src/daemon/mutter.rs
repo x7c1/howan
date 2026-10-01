@@ -13,19 +13,23 @@
 //! `org.gnome.Mutter.IdleMonitor`. The methods used:
 //!
 //! - `AddIdleWatch(UInt64 interval_ms) -> UInt32 id` — fires `WatchFired(id)`
-//!   once when the seat has been idle for `interval_ms`.
+//!   every time the seat's idle time crosses `interval_ms`, until the watch is
+//!   removed. Mutter keeps idle watches after they fire.
+//! - `AddUserActiveWatch() -> UInt32 id` — fires `WatchFired(id)` once on the
+//!   next idle → active transition. Mutter removes it after it fires.
 //! - `RemoveWatch(UInt32 id)` — drop a watch.
 //! - `GetIdletime() -> UInt64` — current idle time in ms; used as a cheap
 //!   reachability probe.
 //!
 //! ## Re-arm strategy
 //!
-//! `AddIdleWatch` is one-shot: it fires once and does not re-fire on subsequent
-//! idle periods. To produce an idle event on *every* idle period we re-add an
-//! idle watch after each cycle. The daemon drives the re-arm, and the *kind*
-//! of re-arm depends on which dismiss path ran:
+//! The loop keeps at most one watch registered at a time and adds the next one
+//! only when the daemon asks for it, because the daemon — not Mutter — decides
+//! when the next idle period may show the saver. The daemon drives the re-arm,
+//! and the *kind* of re-arm depends on which dismiss path ran:
 //!
-//! 1. Add an idle watch for `T1`; when it fires, emit [`IdleEvent::Idle`].
+//! 1. Add an idle watch for `T1`; when it fires, remove it and emit
+//!    [`IdleEvent::Idle`].
 //! 2. Block until the daemon sends a [`RearmKind`] through the rearm channel:
 //!    - [`RearmKind::Immediate`] — `Inhibiting` input dismiss. The user just
 //!      produced input, so add a fresh `AddIdleWatch` right away.
@@ -33,6 +37,18 @@
 //!      idle (the timer fired *without* any input), so first add an
 //!      `AddUserActiveWatch`, wait for it to fire on the next genuine
 //!      idle→active transition, and only *then* add the next `AddIdleWatch`.
+//!
+//! ### Why a fired idle watch is removed
+//!
+//! Mutter does not drop an idle watch when it fires; only user-active watches
+//! are removed automatically. A watch left registered fires again on every
+//! later idle period, so each cycle would add one more live watch, and every
+//! idle period would deliver one `WatchFired` per cycle so far. The watch
+//! thread reads `WatchFired` only while it waits for a watch, and zbus stops
+//! reading the connection once a signal stream holds 64 unread messages. The
+//! next method call then never receives its reply and the loop stops for good.
+//! Removing each idle watch as soon as it fires keeps the signal traffic to one
+//! message per watch.
 //!
 //! ### Why an active-watch gate after DpmsHandoff
 //!
@@ -284,10 +300,14 @@ fn run_watch_loop(
             break 'cycles;
         }
 
-        // Idle threshold reached: tell the daemon to show the saver. The idle
-        // watch is one-shot and now consumed.
+        // Idle threshold reached. Mutter keeps the idle watch registered after
+        // it fires (see "Why a fired idle watch is removed"), so remove it
+        // before handing control to the daemon.
+        proxy
+            .remove_watch(armed)
+            .map_err(|err| format!("RemoveWatch({armed}) failed: {err}"))?;
         pending_watch = None;
-        info!(t1_ms = interval_ms, "idle detected");
+        info!(watch_id = armed, t1_ms = interval_ms, "idle detected");
         if sender.send(IdleEvent::Idle).is_err() {
             // The daemon has exited; stop the loop.
             break;
@@ -325,9 +345,12 @@ fn run_watch_loop(
         }
     }
 
-    // Best-effort cleanup of any outstanding watch.
+    // Best-effort cleanup of any outstanding watch: the process is exiting and
+    // Mutter drops the watches of a vanished connection anyway.
     if let Some(id) = pending_watch {
-        let _ = proxy.remove_watch(id);
+        if let Err(err) = proxy.remove_watch(id) {
+            warn!(watch_id = id, error = %err, "failed to remove watch on shutdown");
+        }
     }
     Ok(())
 }
