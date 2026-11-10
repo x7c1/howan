@@ -51,7 +51,7 @@ wgpu = { version = "22", features = ["naga-ir"] }
 # with `naga::valid::Validator`, and handed to wgpu via `ShaderSource::Naga` —
 # the same naga IR + validation the WGSL path goes through, so GLSL never reaches
 # the driver as raw text. See docs/guides/50-shader-player.md.
-naga = { version = "22", features = ["glsl-in"] }
+naga = { version = "30", features = ["glsl-in"] }
 raw-window-handle = "0.6"
 # `pollster` blocks on wgpu's async adapter/device requests so the renderer can
 # be created from the synchronous Wayland setup path without pulling in a full
