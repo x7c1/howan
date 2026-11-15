@@ -12,6 +12,12 @@ Pre-1.0. Under active development.
 cargo build
 ```
 
+The Rust version is pinned in [`rust-toolchain.toml`](rust-toolchain.toml),
+which every `cargo` call here (and CI) uses when Rust is installed through
+rustup; rustup installs it on first use, and Dependabot raises the pin in a
+weekly pull request. A `cargo` not managed by rustup (a distro package, Nix)
+ignores the file and builds with its own version.
+
 ## Install
 
 Install Howan as a systemd `--user` service:

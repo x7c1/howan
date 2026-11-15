@@ -29,3 +29,11 @@ updates:
       cargo-minor-and-patch:
         applies-to: version-updates
         update-types: [minor, patch]
+
+  - package-ecosystem: rust-toolchain
+    directory: /
+    schedule:
+      interval: weekly
+      day: monday
+      time: "04:00"
+      timezone: Asia/Tokyo
