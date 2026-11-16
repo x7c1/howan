@@ -1,0 +1,6 @@
+# The Rust toolchain every `cargo` call in this repository uses, locally and in
+# CI; rustup installs it on first use. Dependabot raises the version in a pull
+# request, so a new Rust release is checked by CI before it reaches `main`.
+[toolchain]
+channel = "1.100.0"
+components = ["rustfmt", "clippy"]
