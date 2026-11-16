@@ -56,7 +56,7 @@ raw-window-handle = "0.6"
 # `pollster` blocks on wgpu's async adapter/device requests so the renderer can
 # be created from the synchronous Wayland setup path without pulling in a full
 # async runtime.
-pollster = "0.4"
+pollster = "1.0"
 # Zero-copy casting of the uniform struct to the byte slice wgpu's
 # `write_buffer` expects, without hand-rolling unsafe transmutes.
 bytemuck = { version = "1", features = ["derive"] }
