@@ -12,7 +12,7 @@ repository = "https://github.com/x7c1/howan"
 # `wl_keyboard` events directly through `wayland-client` and skip the full
 # keymap pipeline. Later milestones can opt back in if real key handling is
 # needed.
-smithay-client-toolkit = { version = "0.20", default-features = false, features = ["calloop"] }
+smithay-client-toolkit = { version = "0.21", default-features = false, features = ["calloop"] }
 # The `system` feature backs proxy IDs with the real libwayland-client
 # `wl_proxy` / `wl_display` pointers (via wayland-sys). wgpu's Wayland WSI needs
 # those raw C pointers to create a surface, so the GPU renderer reaches them
