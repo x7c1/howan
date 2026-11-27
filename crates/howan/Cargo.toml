@@ -45,7 +45,7 @@ wayland-protocols = { version = "0.32", features = ["client", "unstable"] }
 # `naga-ir` enables `wgpu::ShaderSource::Naga`, letting howan hand wgpu a
 # `naga::Module` it parsed + validated itself (the GLSL/Shadertoy path) instead
 # of raw source. The default features (WGSL, Vulkan, …) stay on.
-wgpu = { version = "22", features = ["naga-ir"] }
+wgpu = { version = "30", features = ["naga-ir"] }
 # `glsl-in` enables naga's GLSL frontend so howan can accept Shadertoy-style
 # GLSL fragment shaders (M7). The source is parsed to a `naga::Module`, validated
 # with `naga::valid::Validator`, and handed to wgpu via `ShaderSource::Naga` —
